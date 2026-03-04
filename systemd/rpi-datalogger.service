@@ -1,0 +1,21 @@
+[Unit]
+Description=RPi CAN/GPS Datalogger
+After=network-online.target sys-subsystem-net-devices-can0.device
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/daniel/rpi-datalogger
+EnvironmentFile=/home/daniel/rpi-datalogger/.env
+ExecStart=/usr/bin/python3 -m datalogger
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rpi-datalogger
+
+[Install]
+WantedBy=multi-user.target
