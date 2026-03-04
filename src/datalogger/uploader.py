@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class Uploader(threading.Thread):
-    """Consumes CAN and GPS queues and uploads to Supabase.
+    """Consumes CAN and GPS queues and uploads to Supabase per-frame.
 
     Falls back to local SQLite buffer when Supabase is unreachable.
     """
@@ -45,18 +45,10 @@ class Uploader(threading.Thread):
         self._connect()
         while not self._stop_event.is_set():
             try:
-                # 1. Drain any buffered records first (offline recovery)
                 self._flush_buffer()
-
-                # 2. Process CAN queue (higher priority, higher volume)
                 self._drain_queue(self.can_queue, "can_frames", self._can_to_row)
-
-                # 3. Process GPS queue
                 self._drain_queue(self.gps_queue, "gps_readings", self._gps_to_row)
-
-                # Small sleep to prevent busy-waiting when queues are empty
                 time.sleep(0.05)
-
             except Exception:
                 logger.exception("Uploader loop error")
                 time.sleep(self.config.upload_retry_interval)
@@ -82,7 +74,7 @@ class Uploader(threading.Thread):
             return True
         except Exception:
             logger.warning("Upload to %s failed, buffering locally", table)
-            self.supabase = None  # force reconnect on next attempt
+            self.supabase = None
             return False
 
     def _flush_buffer(self):
@@ -97,12 +89,11 @@ class Uploader(threading.Thread):
             if self._upload(table, payload):
                 uploaded_ids.append(record_id)
             else:
-                break  # network still down, stop trying
+                break
         self.buffer.delete(uploaded_ids)
 
     @staticmethod
     def _can_to_row(record: dict) -> dict:
-        """Transform a CAN record dict to a Supabase row."""
         return {
             "timestamp": record["timestamp"],
             "device_id": record["device_id"],
@@ -116,7 +107,6 @@ class Uploader(threading.Thread):
 
     @staticmethod
     def _gps_to_row(record: dict) -> dict:
-        """Transform a GPS record dict to a Supabase row."""
         return {
             "timestamp": record["timestamp"],
             "device_id": record["device_id"],

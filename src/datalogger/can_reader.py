@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class CANReader(threading.Thread):
-    """Reads CAN frames from socketcan and places them on a queue."""
+    """Reads CAN frames from socketcan, sampling one frame per second."""
 
     def __init__(self, config, out_queue: queue.Queue):
         super().__init__(name="CANReader", daemon=True)
@@ -30,31 +30,41 @@ class CANReader(threading.Thread):
                 time.sleep(2)
 
     def _read_loop(self):
-        logger.info("Opening CAN bus on %s", self.config.can_interface)
+        logger.info("Opening CAN bus on %s (1 Hz sampling)", self.config.can_interface)
         with can.Bus(
             channel=self.config.can_interface, interface="socketcan"
         ) as bus:
             logger.info("CAN bus opened successfully")
             while not self._stop_event.is_set():
-                msg = bus.recv(timeout=1.0)
-                if msg is None:
+                # Read the latest frame (non-blocking drain, keep last)
+                latest = None
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and not self._stop_event.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    msg = bus.recv(timeout=remaining)
+                    if msg is not None:
+                        latest = msg
+
+                if latest is None or self._stop_event.is_set():
                     continue
 
                 record = {
                     "type": "can",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "device_id": self.config.device_id,
-                    "arb_id": msg.arbitration_id,
-                    "is_extended": msg.is_extended_id,
-                    "is_remote": msg.is_remote_frame,
-                    "dlc": msg.dlc,
-                    "data": bytes(msg.data),
-                    "bus_time": msg.timestamp,
+                    "arb_id": latest.arbitration_id,
+                    "is_extended": latest.is_extended_id,
+                    "is_remote": latest.is_remote_frame,
+                    "dlc": latest.dlc,
+                    "data": bytes(latest.data),
+                    "bus_time": latest.timestamp,
                 }
                 try:
                     self.out_queue.put_nowait(record)
                 except queue.Full:
                     logger.warning(
                         "CAN queue full, dropping frame arb_id=0x%X",
-                        msg.arbitration_id,
+                        latest.arbitration_id,
                     )
