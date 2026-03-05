@@ -343,7 +343,7 @@ source .venv/bin/activate
 PYTHONPATH=src python -m pytest tests/ -v
 ```
 
-114 tests covering CAN reader (noise filtering, ID filtering, backoff), GPS reader (NMEA parsing, throttling), uploader (online/offline transitions, buffering, log draining), SQLite buffer (FIFO ordering, pruning), log handler (rate limiting, component extraction), and startup logging (system status collection).
+121 tests covering CAN reader (noise filtering, ID filtering, backoff), GPS reader (NMEA parsing, throttling), uploader (online/offline transitions, buffering, log draining), SQLite buffer (FIFO ordering, pruning), log handler (rate limiting, component extraction), and startup logging (system status collection).
 
 ## Power Optimization
 
