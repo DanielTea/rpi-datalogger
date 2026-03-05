@@ -1,0 +1,14 @@
+[Unit]
+Description=SIM7600 LTE Data Connection
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sim7600-lte-connect.sh
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
