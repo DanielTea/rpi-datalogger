@@ -8,6 +8,9 @@ import can
 
 logger = logging.getLogger(__name__)
 
+_MIN_BACKOFF = 2.0
+_MAX_BACKOFF = 60.0
+
 
 class CANReader(threading.Thread):
     """Reads CAN frames from socketcan, sampling one frame per second."""
@@ -22,12 +25,17 @@ class CANReader(threading.Thread):
         self._stop_event.set()
 
     def run(self):
+        backoff = _MIN_BACKOFF
         while not self._stop_event.is_set():
             try:
                 self._read_loop()
+                backoff = _MIN_BACKOFF  # reset on clean exit
             except Exception:
-                logger.exception("CAN reader crashed, restarting in 2s")
-                time.sleep(2)
+                logger.exception(
+                    "CAN reader crashed, restarting in %.0fs", backoff
+                )
+                self._stop_event.wait(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
 
     def _read_loop(self):
         logger.info("Opening CAN bus on %s (1 Hz sampling)", self.config.can_interface)
@@ -36,7 +44,6 @@ class CANReader(threading.Thread):
         ) as bus:
             logger.info("CAN bus opened successfully")
             while not self._stop_event.is_set():
-                # Read the latest frame (non-blocking drain, keep last)
                 latest = None
                 deadline = time.monotonic() + 1.0
                 while time.monotonic() < deadline and not self._stop_event.is_set():

@@ -7,11 +7,15 @@ from supabase import create_client, Client
 
 logger = logging.getLogger(__name__)
 
+_MIN_BACKOFF = 5.0
+_MAX_BACKOFF = 120.0
+
 
 class Uploader(threading.Thread):
     """Consumes CAN and GPS queues and uploads to Supabase per-frame.
 
     Falls back to local SQLite buffer when Supabase is unreachable.
+    Uses exponential backoff when uploads fail to avoid tight loops.
     """
 
     def __init__(self, config, can_queue: queue.Queue, gps_queue: queue.Queue, buffer):
@@ -22,6 +26,8 @@ class Uploader(threading.Thread):
         self.buffer = buffer
         self._stop_event = threading.Event()
         self.supabase: Client | None = None
+        self._backoff = _MIN_BACKOFF
+        self._offline = False
 
     def stop(self):
         self._stop_event.set()
@@ -45,13 +51,59 @@ class Uploader(threading.Thread):
         self._connect()
         while not self._stop_event.is_set():
             try:
+                if self._offline:
+                    # Backoff: buffer incoming data, don't attempt uploads
+                    self._buffer_queues()
+                    logger.info(
+                        "Offline — retrying in %.0fs (buffered=%d)",
+                        self._backoff, self.buffer.count(),
+                    )
+                    self._stop_event.wait(self._backoff)
+                    # Try to reconnect
+                    if self._connect() and self._test_connection():
+                        logger.info("Back online, resuming uploads")
+                        self._offline = False
+                        self._backoff = _MIN_BACKOFF
+                    else:
+                        self._backoff = min(self._backoff * 2, _MAX_BACKOFF)
+                    continue
+
                 self._flush_buffer()
                 self._drain_queue(self.can_queue, "can_frames", self._can_to_row)
                 self._drain_queue(self.gps_queue, "gps_readings", self._gps_to_row)
-                time.sleep(0.05)
+                self._stop_event.wait(0.05)
             except Exception:
                 logger.exception("Uploader loop error")
-                time.sleep(self.config.upload_retry_interval)
+                self._go_offline()
+
+    def _go_offline(self):
+        """Enter offline mode with backoff."""
+        self._offline = True
+        self.supabase = None
+
+    def _test_connection(self) -> bool:
+        """Quick connectivity check against Supabase."""
+        if self.supabase is None:
+            return False
+        try:
+            self.supabase.table("can_frames").select("id").limit(1).execute()
+            return True
+        except Exception:
+            self.supabase = None
+            return False
+
+    def _buffer_queues(self):
+        """Drain both queues into local buffer while offline."""
+        for q, table, transform in [
+            (self.can_queue, "can_frames", self._can_to_row),
+            (self.gps_queue, "gps_readings", self._gps_to_row),
+        ]:
+            while not q.empty():
+                try:
+                    record = q.get_nowait()
+                except queue.Empty:
+                    break
+                self.buffer.push(table, transform(record))
 
     def _drain_queue(self, q: queue.Queue, table: str, transform):
         """Drain all items from a queue and upload them."""
@@ -63,6 +115,15 @@ class Uploader(threading.Thread):
             row = transform(record)
             if not self._upload(table, row):
                 self.buffer.push(table, row)
+                # Buffer the rest without attempting uploads
+                self._go_offline()
+                while not q.empty():
+                    try:
+                        record = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    self.buffer.push(table, transform(record))
+                return
 
     def _upload(self, table: str, row: dict) -> bool:
         """Upload a single row to Supabase. Returns True on success."""
@@ -89,6 +150,7 @@ class Uploader(threading.Thread):
             if self._upload(table, payload):
                 uploaded_ids.append(record_id)
             else:
+                self._go_offline()
                 break
         self.buffer.delete(uploaded_ids)
 

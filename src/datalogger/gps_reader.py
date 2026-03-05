@@ -8,6 +8,9 @@ import serial
 
 logger = logging.getLogger(__name__)
 
+_MIN_BACKOFF = 2.0
+_MAX_BACKOFF = 60.0
+
 
 def _nmea_to_decimal(raw_value: str, direction: str) -> float:
     """Convert NMEA ddmm.mmmmmm to decimal degrees."""
@@ -36,12 +39,17 @@ class GPSReader(threading.Thread):
         self._stop_event.set()
 
     def run(self):
+        backoff = _MIN_BACKOFF
         while not self._stop_event.is_set():
             try:
                 self._read_loop()
+                backoff = _MIN_BACKOFF  # reset on clean exit
             except Exception:
-                logger.exception("GPS reader crashed, restarting in 5s")
-                time.sleep(5)
+                logger.exception(
+                    "GPS reader crashed, restarting in %.0fs", backoff
+                )
+                self._stop_event.wait(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
 
     def _read_loop(self):
         logger.info(
@@ -56,25 +64,30 @@ class GPSReader(threading.Thread):
         ) as ser:
             logger.info("GPS serial opened")
             while not self._stop_event.is_set():
-                # Flush input buffer before sending command
-                ser.reset_input_buffer()
-                ser.write(b"AT+CGPSINFO\r\n")
-                time.sleep(0.3)
+                try:
+                    ser.reset_input_buffer()
+                    ser.write(b"AT+CGPSINFO\r\n")
+                    time.sleep(0.3)
 
-                response = ser.read(ser.in_waiting or 256).decode(
-                    "ascii", errors="replace"
-                )
+                    response = ser.read(ser.in_waiting or 256).decode(
+                        "ascii", errors="replace"
+                    )
 
-                parsed = self._parse_cgpsinfo(response)
-                if parsed:
-                    parsed["type"] = "gps"
-                    parsed["timestamp"] = datetime.now(timezone.utc).isoformat()
-                    parsed["device_id"] = self.config.device_id
-                    parsed["raw_response"] = response.strip()
-                    try:
-                        self.out_queue.put_nowait(parsed)
-                    except queue.Full:
-                        logger.warning("GPS queue full, dropping reading")
+                    parsed = self._parse_cgpsinfo(response)
+                    if parsed:
+                        parsed["type"] = "gps"
+                        parsed["timestamp"] = datetime.now(timezone.utc).isoformat()
+                        parsed["device_id"] = self.config.device_id
+                        parsed["raw_response"] = response.strip()
+                        try:
+                            self.out_queue.put_nowait(parsed)
+                        except queue.Full:
+                            logger.warning("GPS queue full, dropping reading")
+                except serial.SerialException:
+                    logger.warning("GPS serial error, port may have disconnected")
+                    raise  # let run() handle with backoff
+                except Exception:
+                    logger.exception("GPS read error")
 
                 self._stop_event.wait(self.config.gps_poll_interval)
 
@@ -83,7 +96,6 @@ class GPSReader(threading.Thread):
         """Parse AT+CGPSINFO response.
 
         Format: +CGPSINFO: lat,N/S,lon,E/W,date,time,alt,speed,course
-        Example: +CGPSINFO: 5232.352790,N,01324.503530,E,040326,123725.0,83.4,0.0,
         """
         for line in response.splitlines():
             if "+CGPSINFO:" not in line:

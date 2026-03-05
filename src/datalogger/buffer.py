@@ -5,11 +5,17 @@ import sqlite3
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MAX_RECORDS = 100_000
+
 
 class LocalBuffer:
-    """SQLite-backed FIFO queue for offline resilience."""
+    """SQLite-backed FIFO queue for offline resilience.
 
-    def __init__(self, db_path: str):
+    Automatically prunes oldest records when max_records is exceeded
+    to prevent unbounded growth on the SD card.
+    """
+
+    def __init__(self, db_path: str, max_records: int = _DEFAULT_MAX_RECORDS):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -24,6 +30,7 @@ class LocalBuffer:
         """
         )
         self.conn.commit()
+        self.max_records = max_records
 
     def push(self, table_name: str, record: dict):
         """Push a record to the buffer for later upload."""
@@ -32,6 +39,22 @@ class LocalBuffer:
             (table_name, json.dumps(record, default=str)),
         )
         self.conn.commit()
+        self._prune()
+
+    def _prune(self):
+        """Remove oldest records if buffer exceeds max size."""
+        count = self.count()
+        if count > self.max_records:
+            excess = count - self.max_records
+            self.conn.execute(
+                "DELETE FROM pending WHERE id IN "
+                "(SELECT id FROM pending ORDER BY id ASC LIMIT ?)",
+                (excess,),
+            )
+            self.conn.commit()
+            logger.warning(
+                "Buffer pruned %d oldest records (max=%d)", excess, self.max_records
+            )
 
     def peek(self, limit: int = 50) -> list[tuple[int, str, dict]]:
         """Peek at the oldest buffered records without removing them."""

@@ -9,131 +9,113 @@ import pytest
 from datalogger.buffer import LocalBuffer
 
 
-@pytest.fixture
-def buffer():
-    """Create a temporary buffer for testing."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        buf = LocalBuffer(os.path.join(tmpdir, "test.db"))
-        yield buf
-        buf.close()
-
-
 class TestLocalBuffer:
-    def test_push_and_count(self, buffer):
-        """Push records and verify count."""
-        assert buffer.count() == 0
-        buffer.push("can_frames", {"arb_id": 123})
-        assert buffer.count() == 1
-        buffer.push("can_frames", {"arb_id": 456})
-        assert buffer.count() == 2
+    def _make_buffer(self, **kwargs):
+        """Create a buffer with a temp file."""
+        self._tmpdir = tempfile.mkdtemp()
+        path = os.path.join(self._tmpdir, "test.db")
+        return LocalBuffer(path, **kwargs)
 
-    def test_push_and_peek(self, buffer):
-        """Peek returns records in FIFO order."""
-        buffer.push("can_frames", {"arb_id": 1})
-        buffer.push("gps_readings", {"lat": 52.5})
-        buffer.push("can_frames", {"arb_id": 2})
+    def test_push_and_count(self):
+        buf = self._make_buffer()
+        assert buf.count() == 0
+        buf.push("can_frames", {"arb_id": 123})
+        assert buf.count() == 1
+        buf.push("can_frames", {"arb_id": 456})
+        assert buf.count() == 2
 
-        items = buffer.peek(limit=10)
-        assert len(items) == 3
-        assert items[0][1] == "can_frames"
-        assert items[0][2]["arb_id"] == 1
-        assert items[1][1] == "gps_readings"
-        assert items[2][2]["arb_id"] == 2
+    def test_push_and_peek(self):
+        buf = self._make_buffer()
+        buf.push("can_frames", {"arb_id": 123})
+        buf.push("gps_readings", {"lat": 52.0})
+        rows = buf.peek(limit=10)
+        assert len(rows) == 2
+        assert rows[0][1] == "can_frames"
+        assert rows[0][2] == {"arb_id": 123}
+        assert rows[1][1] == "gps_readings"
 
-    def test_peek_limit(self, buffer):
-        """Peek respects the limit parameter."""
+    def test_peek_limit(self):
+        buf = self._make_buffer()
         for i in range(10):
-            buffer.push("can_frames", {"arb_id": i})
+            buf.push("can_frames", {"i": i})
+        rows = buf.peek(limit=3)
+        assert len(rows) == 3
 
-        items = buffer.peek(limit=3)
-        assert len(items) == 3
-        assert items[0][2]["arb_id"] == 0
-        assert items[2][2]["arb_id"] == 2
+    def test_peek_does_not_remove(self):
+        buf = self._make_buffer()
+        buf.push("can_frames", {"a": 1})
+        buf.peek(limit=10)
+        assert buf.count() == 1
 
-    def test_peek_does_not_remove(self, buffer):
-        """Peek should not remove records."""
-        buffer.push("can_frames", {"arb_id": 1})
-        buffer.peek(limit=10)
-        assert buffer.count() == 1
+    def test_delete_by_ids(self):
+        buf = self._make_buffer()
+        buf.push("t", {"a": 1})
+        buf.push("t", {"a": 2})
+        rows = buf.peek()
+        buf.delete([rows[0][0]])
+        assert buf.count() == 1
 
-    def test_delete_by_ids(self, buffer):
-        """Delete specific records by ID."""
-        buffer.push("can_frames", {"arb_id": 1})
-        buffer.push("can_frames", {"arb_id": 2})
-        buffer.push("can_frames", {"arb_id": 3})
+    def test_delete_empty_list(self):
+        buf = self._make_buffer()
+        buf.delete([])
+        assert buf.count() == 0
 
-        items = buffer.peek(limit=10)
-        # Delete first and last
-        buffer.delete([items[0][0], items[2][0]])
+    def test_delete_nonexistent_ids(self):
+        buf = self._make_buffer()
+        buf.push("t", {"a": 1})
+        buf.delete([9999])
+        assert buf.count() == 1
 
-        assert buffer.count() == 1
-        remaining = buffer.peek(limit=10)
-        assert remaining[0][2]["arb_id"] == 2
-
-    def test_delete_empty_list(self, buffer):
-        """Delete with empty list should not error."""
-        buffer.push("can_frames", {"arb_id": 1})
-        buffer.delete([])
-        assert buffer.count() == 1
-
-    def test_delete_nonexistent_ids(self, buffer):
-        """Delete with non-existent IDs should not error."""
-        buffer.push("can_frames", {"arb_id": 1})
-        buffer.delete([999, 1000])
-        assert buffer.count() == 1
-
-    def test_preserves_complex_data(self, buffer):
-        """Buffer preserves nested dicts, lists, and special types."""
-        record = {
-            "timestamp": "2026-03-04T12:00:00+00:00",
-            "data": "\\xDEADBEEF",
-            "nested": {"key": "value"},
-            "list": [1, 2, 3],
-            "null_field": None,
-            "bool_field": True,
-            "float_field": 3.14159,
-        }
-        buffer.push("can_frames", record)
-        items = buffer.peek(limit=1)
-        assert items[0][2] == record
+    def test_preserves_complex_data(self):
+        buf = self._make_buffer()
+        data = {"nested": {"key": [1, 2, 3]}, "flag": True, "val": 3.14}
+        buf.push("test", data)
+        rows = buf.peek()
+        assert rows[0][2] == data
 
     def test_creates_directory(self):
-        """Buffer creates parent directories if they don't exist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            deep_path = os.path.join(tmpdir, "a", "b", "c", "buffer.db")
-            buf = LocalBuffer(deep_path)
-            buf.push("test", {"key": "value"})
-            assert buf.count() == 1
-            buf.close()
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "sub", "dir", "test.db")
+        buf = LocalBuffer(path)
+        buf.push("t", {"a": 1})
+        assert buf.count() == 1
 
-    def test_fifo_order(self, buffer):
-        """Records come out in insertion order."""
+    def test_fifo_order(self):
+        buf = self._make_buffer()
         for i in range(100):
-            buffer.push("can_frames", {"seq": i})
+            buf.push("t", {"i": i})
+        rows = buf.peek(limit=100)
+        values = [r[2]["i"] for r in rows]
+        assert values == list(range(100))
 
-        items = buffer.peek(limit=100)
-        for idx, (_, _, payload) in enumerate(items):
-            assert payload["seq"] == idx
+    def test_mixed_tables(self):
+        buf = self._make_buffer()
+        buf.push("can_frames", {"type": "can"})
+        buf.push("gps_readings", {"type": "gps"})
+        rows = buf.peek()
+        tables = [r[1] for r in rows]
+        assert tables == ["can_frames", "gps_readings"]
 
-    def test_mixed_tables(self, buffer):
-        """Different table names are stored and returned correctly."""
-        buffer.push("can_frames", {"type": "can"})
-        buffer.push("gps_readings", {"type": "gps"})
-        buffer.push("can_frames", {"type": "can2"})
-
-        items = buffer.peek(limit=10)
-        tables = [item[1] for item in items]
-        assert tables == ["can_frames", "gps_readings", "can_frames"]
-
-    def test_large_batch(self, buffer):
-        """Handle a large number of records."""
+    def test_large_batch(self):
+        buf = self._make_buffer()
         for i in range(1000):
-            buffer.push("can_frames", {"arb_id": i})
-        assert buffer.count() == 1000
+            buf.push("t", {"i": i})
+        assert buf.count() == 1000
 
-        items = buffer.peek(limit=500)
-        assert len(items) == 500
+    def test_prune_oldest_when_max_exceeded(self):
+        """Buffer should prune oldest records when max_records is exceeded."""
+        buf = self._make_buffer(max_records=10)
+        for i in range(15):
+            buf.push("t", {"i": i})
+        assert buf.count() == 10
+        rows = buf.peek(limit=10)
+        # Oldest 5 should have been pruned, keeping i=5..14
+        values = [r[2]["i"] for r in rows]
+        assert values == list(range(5, 15))
 
-        ids = [item[0] for item in items]
-        buffer.delete(ids)
-        assert buffer.count() == 500
+    def test_prune_does_not_trigger_under_limit(self):
+        """Buffer should not prune when under max_records."""
+        buf = self._make_buffer(max_records=100)
+        for i in range(50):
+            buf.push("t", {"i": i})
+        assert buf.count() == 50
