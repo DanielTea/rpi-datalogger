@@ -146,6 +146,40 @@ Check the Supabase dashboard for incoming rows in `can_frames` and `gps_readings
 sudo systemctl start sim7600-gps sim7600-lte rpi-datalogger
 ```
 
+### Verifying the Setup
+
+After completing all setup steps, run through these checks to confirm everything is working:
+
+```bash
+# 1. Check all three services are active
+systemctl status sim7600-gps sim7600-lte rpi-datalogger
+
+# 2. Verify udev symlinks exist for the SIM7600
+ls -la /dev/sim7600-*
+# Expected: /dev/sim7600-at, /dev/sim7600-nmea, /dev/sim7600-diag, /dev/sim7600-audio
+
+# 3. Verify CAN interface is up
+ip link show can0
+# Expected: state UP, qlen 10, type can, bitrate 500000
+
+# 4. Verify GPS serial port is readable
+cat /dev/sim7600-nmea | head -5
+# Expected: NMEA sentences like $GPRMC,... $GPGGA,...
+
+# 5. Verify LTE connectivity
+ip addr show usb0
+ping -c 3 -I usb0 8.8.8.8
+
+# 6. Check datalogger logs for successful uploads
+journalctl -u rpi-datalogger --since "5 min ago" --no-pager | tail -20
+# Expected: "uploaded" messages for CAN and/or GPS records
+
+# 7. Check Supabase for data (from any machine with curl)
+curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/gps_readings?order=id.desc&limit=1" \
+  -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" | python3 -m json.tool
+# Expected: JSON array with your latest GPS reading
+```
+
 ## Monitoring
 
 ```bash
@@ -157,6 +191,27 @@ systemctl status sim7600-gps sim7600-lte rpi-datalogger
 
 # Check for undervoltage (power supply issues)
 vcgencmd get_throttled
+```
+
+### Verifying Monitoring
+
+```bash
+# Confirm journald is capturing datalogger output
+journalctl -u rpi-datalogger --since "1 hour ago" | grep -c "uploaded"
+# Expected: non-zero count (one per successful upload batch)
+
+# Verify startup logs reached Supabase
+curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/device_logs?level=eq.INFO&order=id.desc&limit=2" \
+  -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" | python3 -m json.tool
+# Expected: two INFO records — "Datalogger started" and "System status at startup"
+
+# Verify error logs are forwarded (trigger a test by temporarily stopping GPS)
+sudo systemctl stop sim7600-gps
+sleep 10
+curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/device_logs?level=eq.ERROR&order=id.desc&limit=3" \
+  -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" | python3 -m json.tool
+sudo systemctl start sim7600-gps
+# Expected: ERROR record from gps_reader about serial port failure
 ```
 
 ## Supabase Tables
@@ -207,6 +262,31 @@ On every startup, two INFO-level records are pushed directly to this table:
 - **Startup config** — device ID, CAN interface, GPS port, Supabase connectivity
 - **System status** — CPU temperature, throttle state, memory, disk, uptime, kernel version
 
+### Verifying Supabase Tables
+
+```bash
+# Check row counts for each table
+for TABLE in can_frames gps_readings device_logs; do
+  echo -n "$TABLE: "
+  curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/$TABLE?select=count" \
+    -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" \
+    -H "Prefer: count=exact" -o /dev/null -w "%{http_code}" && echo " OK"
+done
+
+# Verify CAN frames are arriving (requires active CAN bus)
+curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/can_frames?order=id.desc&limit=1" \
+  -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" | python3 -m json.tool
+
+# Verify GPS readings are arriving
+curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/gps_readings?order=id.desc&limit=1" \
+  -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" | python3 -m json.tool
+
+# Verify device_logs has startup records
+curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/device_logs?component=eq.system&order=id.desc&limit=2" \
+  -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" | python3 -m json.tool
+# Expected: "Datalogger started" and "System status at startup" entries
+```
+
 ## Fault Tolerance
 
 The system is designed to survive unattended operation:
@@ -217,6 +297,44 @@ The system is designed to survive unattended operation:
 - **GPS cold start**: GPS data uploads begin as soon as a satellite fix is acquired. CAN data uploads independently without waiting for GPS.
 - **USB resets**: Udev rules ensure stable device symlinks across USB re-enumeration. Services restart automatically via systemd.
 - **Crash recovery**: All threads use exponential backoff (CAN: 2-60s, GPS: 2-60s, Uploader: 5-120s) to avoid tight crash loops.
+
+### Verifying Fault Tolerance
+
+```bash
+# Test offline buffering — disconnect LTE, wait, reconnect
+sudo ifconfig usb0 down
+sleep 30
+# Datalogger should keep running, buffering to SQLite:
+journalctl -u rpi-datalogger --since "1 min ago" | grep -i "buffer"
+# Check buffer file exists and has records:
+ls -la /var/lib/rpi-datalogger/buffer.db
+sudo ifconfig usb0 up
+sleep 15
+# Buffer should flush — look for "flushed" or "drained" messages:
+journalctl -u rpi-datalogger --since "1 min ago" | grep -i "flush\|drain"
+
+# Test CAN bus disconnect recovery — unplug OBD cable, wait, replug
+# Logs should show noise filtering kicking in (< 5 frames/sec = ignored)
+journalctl -u rpi-datalogger -f | grep -i "can\|noise"
+
+# Test GPS cold start — restart the GPS service
+sudo systemctl restart sim7600-gps
+sleep 30
+# GPS uploads should resume once a satellite fix is acquired:
+journalctl -u rpi-datalogger --since "1 min ago" | grep -i "gps"
+
+# Test crash recovery — kill the datalogger process
+sudo systemctl kill -s KILL rpi-datalogger
+sleep 5
+# systemd should restart it automatically:
+systemctl status rpi-datalogger
+# Expected: active (running), recent start time
+
+# Test power cycle — just reboot
+sudo reboot
+# After boot, all three services should be running:
+systemctl status sim7600-gps sim7600-lte rpi-datalogger
+```
 
 ## Running Tests
 
@@ -293,6 +411,46 @@ sudo reboot
 | GPU memory 16MB | ~5-10mA | Headless operation, no GPU needed |
 | Disable arm_boost | reduces spikes | Prevents transient current draw |
 
+### Verifying Power Optimizations
+
+After rebooting with the power optimizations applied:
+
+```bash
+# 1. Check CPU cores — should show only 2 online
+nproc
+# Expected: 2
+
+cat /proc/cpuinfo | grep "^processor"
+# Expected: processor 0 and processor 1 only
+
+# 2. Check CPU governor — should be powersave
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+# Expected: powersave
+
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+# Expected: 600000 (600 MHz)
+
+# 3. Check HDMI is off
+vcgencmd display_power
+# Expected: display_power=0
+
+# 4. Check no GPU/DRM driver loaded
+ls /dev/dri 2>/dev/null
+# Expected: "No such file or directory"
+
+# 5. Check Bluetooth is disabled
+systemctl is-enabled hciuart bluetooth 2>/dev/null
+# Expected: disabled (or "not found")
+
+hciconfig 2>/dev/null
+# Expected: no output or command not found
+
+# 6. Check throttle state (most important!)
+vcgencmd get_throttled
+# Expected: throttled=0x0 (clean, no undervoltage)
+# If 0x1 or 0x50005: power supply is too weak
+```
+
 ### Checking Power Status
 
 ```bash
@@ -336,6 +494,35 @@ AT+CUSBPIDSWITCH=9011,1,1
 
 **Warning**: This command reboots the modem. Ensure a stable power supply (2.5A+) to avoid USB bus crashes during the switch.
 
+### Verifying LTE Connectivity
+
+```bash
+# 1. Check usb0 interface has an IP
+ip addr show usb0
+# Expected: inet 192.168.225.x/24
+
+# 2. Verify internet access over LTE
+ping -c 3 -I usb0 8.8.8.8
+# Expected: 3 packets received, ~50-200ms latency
+
+# 3. Verify the default route goes through usb0
+ip route show default
+# Expected: default via 192.168.225.1 dev usb0
+
+# 4. Verify DNS resolution works
+nslookup supabase.co
+# Expected: resolves to an IP address
+
+# 5. Check modem status via AT commands
+echo -e "AT+CSQ\r" > /dev/sim7600-at && sleep 1 && cat /dev/sim7600-at
+# Expected: +CSQ: X,Y where X > 10 means decent signal
+
+# 6. Check LTE monitor is watching the connection
+systemctl status sim7600-lte
+journalctl -u sim7600-lte --since "10 min ago" --no-pager | tail -5
+# Expected: active, periodic route checks
+```
+
 ## Remote Access (Tailscale)
 
 The Pi's LTE connection is behind carrier-grade NAT (CGNAT), so it can't be reached directly. [Tailscale](https://tailscale.com/) creates a mesh VPN that works through NAT, giving the Pi a stable IP reachable from anywhere.
@@ -363,3 +550,37 @@ ssh daniel@raspberrypi.tail9ba309.ts.net
 ```
 
 Tailscale survives reboots (`tailscaled.service` is enabled by default). Works over LTE, WiFi, or any network — no port forwarding needed.
+
+### Verifying Tailscale
+
+```bash
+# On the Pi:
+
+# 1. Check Tailscale is running and authenticated
+tailscale status
+# Expected: shows this machine and any other devices on your tailnet
+
+# 2. Check the Pi's Tailscale IP
+tailscale ip -4
+# Expected: 100.x.y.z
+
+# 3. Verify Tailscale service survives reboot
+systemctl is-enabled tailscaled
+# Expected: enabled
+
+# From your laptop:
+
+# 4. SSH via Tailscale IP (use your Pi's Tailscale IP from step 2)
+ssh daniel@100.x.y.z
+
+# 5. SSH via MagicDNS hostname
+ssh daniel@raspberrypi.tail9ba309.ts.net
+
+# 6. Verify connection works over LTE (disconnect Pi from WiFi first)
+# On the Pi:
+sudo ifconfig wlan0 down
+# From your laptop — SSH should still work via Tailscale:
+ssh daniel@100.x.y.z
+# Reconnect WiFi when done:
+# On the Pi: sudo ifconfig wlan0 up
+```
