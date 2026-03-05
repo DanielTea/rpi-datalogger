@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import threading
 import time
@@ -10,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 _MIN_BACKOFF = 2.0
 _MAX_BACKOFF = 60.0
+_PORT_WAIT_INTERVAL = 1.0
+_PORT_WAIT_MAX = 30.0
 
 
 def _nmea_to_decimal(raw_value: str, direction: str) -> float:
@@ -39,6 +42,7 @@ class GPSReader(threading.Thread):
         self.config = config
         self.out_queue = out_queue
         self._stop_event = threading.Event()
+        self._had_successful_read = False
 
     def stop(self):
         self._stop_event.set()
@@ -50,13 +54,42 @@ class GPSReader(threading.Thread):
                 self._read_loop()
                 backoff = _MIN_BACKOFF
             except Exception:
-                logger.exception(
-                    "GPS reader crashed, restarting in %.0fs", backoff
-                )
+                if self._had_successful_read:
+                    # Was working, likely a transient USB glitch — reset backoff
+                    backoff = _MIN_BACKOFF
+                    logger.warning(
+                        "GPS reader lost connection after successful reads, "
+                        "restarting in %.0fs",
+                        backoff,
+                    )
+                else:
+                    logger.error(
+                        "GPS reader crashed, restarting in %.0fs", backoff
+                    )
+                self._wait_for_port()
                 self._stop_event.wait(backoff)
                 backoff = min(backoff * 2, _MAX_BACKOFF)
 
+    def _wait_for_port(self):
+        """Block until the serial port device file exists (USB re-enumeration)."""
+        port = self.config.gps_serial_port
+        if os.path.exists(port):
+            return
+        logger.info("Waiting for %s to reappear...", port)
+        waited = 0.0
+        while not self._stop_event.is_set() and waited < _PORT_WAIT_MAX:
+            self._stop_event.wait(_PORT_WAIT_INTERVAL)
+            waited += _PORT_WAIT_INTERVAL
+            if os.path.exists(port):
+                logger.info("%s reappeared after %.0fs", port, waited)
+                return
+        if not os.path.exists(port):
+            logger.warning(
+                "%s did not reappear after %.0fs", port, _PORT_WAIT_MAX
+            )
+
     def _read_loop(self):
+        self._had_successful_read = False
         logger.info(
             "Opening GPS serial on %s @ %d",
             self.config.gps_serial_port,
@@ -77,6 +110,7 @@ class GPSReader(threading.Thread):
                     line = ser.readline().decode("ascii", errors="replace").strip()
                     if not line:
                         continue
+                    self._had_successful_read = True
 
                     # Parse GPRMC for lat, lon, speed, course
                     if line.startswith("$GPRMC") or line.startswith("$GNRMC"):

@@ -1,5 +1,6 @@
 """Tests for GPS NMEA parsing and GPSReader."""
 
+import os
 import queue
 import threading
 import time
@@ -373,8 +374,151 @@ class TestGPSReaderReadLoop:
             return original_wait(0)
 
         reader._stop_event.wait = capture_wait
-        reader.run()
+        with patch.object(reader, "_wait_for_port"):
+            reader.run()
 
         assert crash_count == 2
         assert waits[0] == 2.0  # _MIN_BACKOFF
         assert waits[1] == 4.0  # doubled
+
+    def test_backoff_resets_after_successful_read(self):
+        """Backoff should reset to MIN after a crash that had successful reads."""
+        reader, _ = self._make_reader([])
+        crash_count = 0
+
+        def fake_read_loop():
+            nonlocal crash_count
+            crash_count += 1
+            # Simulate that data was successfully read before crash
+            reader._had_successful_read = True
+            if crash_count >= 3:
+                reader.stop()
+            raise RuntimeError("USB glitch")
+
+        reader._read_loop = fake_read_loop
+        waits = []
+        original_wait = reader._stop_event.wait
+
+        def capture_wait(timeout=None):
+            if timeout is not None:
+                waits.append(timeout)
+            return original_wait(0)
+
+        reader._stop_event.wait = capture_wait
+        with patch.object(reader, "_wait_for_port"):
+            reader.run()
+
+        assert crash_count == 3
+        # Every crash resets to MIN because _had_successful_read is True
+        assert waits[0] == 2.0
+        assert waits[1] == 2.0
+        assert waits[2] == 2.0
+
+    def test_backoff_escalates_without_successful_read(self):
+        """Backoff should escalate when no data was read (persistent failure)."""
+        reader, _ = self._make_reader([])
+        crash_count = 0
+
+        def fake_read_loop():
+            nonlocal crash_count
+            crash_count += 1
+            # _had_successful_read stays False (port can't open)
+            reader._had_successful_read = False
+            if crash_count >= 3:
+                reader.stop()
+            raise RuntimeError("port missing")
+
+        reader._read_loop = fake_read_loop
+        waits = []
+        original_wait = reader._stop_event.wait
+
+        def capture_wait(timeout=None):
+            if timeout is not None:
+                waits.append(timeout)
+            return original_wait(0)
+
+        reader._stop_event.wait = capture_wait
+        with patch.object(reader, "_wait_for_port"):
+            reader.run()
+
+        assert crash_count == 3
+        assert waits[0] == 2.0   # MIN
+        assert waits[1] == 4.0   # doubled
+        assert waits[2] == 8.0   # doubled again
+
+
+class TestWaitForPort:
+    def _make_reader(self):
+        config = MagicMock()
+        config.gps_serial_port = "/dev/fake-port"
+        config.gps_serial_baud = 115200
+        config.gps_poll_interval = 1.0
+        config.device_id = "test-001"
+        return GPSReader(config, queue.Queue())
+
+    def test_returns_immediately_if_port_exists(self):
+        reader = self._make_reader()
+        with patch("datalogger.gps_reader.os.path.exists", return_value=True):
+            reader._wait_for_port()  # should not block
+
+    def test_waits_until_port_appears(self):
+        reader = self._make_reader()
+        call_count = 0
+
+        def exists_side_effect(path):
+            nonlocal call_count
+            call_count += 1
+            # Port missing on first 3 checks, then appears
+            return call_count > 3
+
+        with patch("datalogger.gps_reader.os.path.exists", side_effect=exists_side_effect):
+            with patch.object(reader._stop_event, "wait", return_value=False):
+                reader._wait_for_port()
+        # First check (missing) + 3 poll checks = 4 total before success
+        assert call_count == 4
+
+    def test_gives_up_after_max_wait(self):
+        reader = self._make_reader()
+        with patch("datalogger.gps_reader.os.path.exists", return_value=False):
+            with patch.object(reader._stop_event, "wait", return_value=False):
+                with patch("datalogger.gps_reader._PORT_WAIT_MAX", 3.0):
+                    with patch("datalogger.gps_reader._PORT_WAIT_INTERVAL", 1.0):
+                        reader._wait_for_port()  # should not hang
+
+    def test_respects_stop_event(self):
+        reader = self._make_reader()
+        reader._stop_event.set()
+        with patch("datalogger.gps_reader.os.path.exists", return_value=False):
+            reader._wait_for_port()  # should exit immediately due to stop
+
+    def test_successful_read_flag_set_on_data(self):
+        """_had_successful_read should be set when data is read."""
+        config = MagicMock()
+        config.gps_serial_port = "/dev/null"
+        config.gps_serial_baud = 115200
+        config.gps_poll_interval = 1.0
+        config.device_id = "test-001"
+        reader = GPSReader(config, queue.Queue())
+
+        assert reader._had_successful_read is False
+
+        rmc = "$GPRMC,123519,V,,,,,,,230394,,,N*7F"  # void, no fix
+        mock_serial = MagicMock()
+        call_count = 0
+
+        def readline_side_effect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (rmc + "\r\n").encode()
+            reader.stop()
+            return b""
+
+        mock_serial.readline = readline_side_effect
+        mock_serial.__enter__ = lambda s: s
+        mock_serial.__exit__ = MagicMock(return_value=False)
+
+        with patch("datalogger.gps_reader.serial.Serial", return_value=mock_serial):
+            reader._read_loop()
+
+        assert reader._had_successful_read is True
