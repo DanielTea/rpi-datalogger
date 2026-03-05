@@ -1,13 +1,12 @@
 [Unit]
 Description=Enable SIM7600 GPS
-After=multi-user.target
-ConditionPathExists=/dev/sim7600-at
+After=network.target
+Wants=network.target
 
 [Service]
 Type=oneshot
-ExecStartPre=/bin/sleep 3
-ExecStart=/bin/bash -c 'test -c /dev/sim7600-at && echo -e "AT+CGPS=1\r" > /dev/sim7600-at || echo "GPS port not available"'
 RemainAfterExit=yes
+ExecStart=/home/daniel/rpi-datalogger/.venv/bin/python3 /opt/sim7600/enable-gps.py
 
 [Install]
 WantedBy=multi-user.target

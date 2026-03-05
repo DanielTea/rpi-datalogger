@@ -1,7 +1,7 @@
 [Unit]
 Description=RPi CAN/GPS Datalogger
-After=network-online.target sys-subsystem-net-devices-can0.device
-Wants=network-online.target
+After=network-online.target sys-subsystem-net-devices-can0.device sim7600-lte.service sim7600-gps.service
+Wants=network-online.target sim7600-lte.service sim7600-gps.service
 
 [Service]
 Type=simple
