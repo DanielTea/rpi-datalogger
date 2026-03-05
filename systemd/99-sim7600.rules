@@ -1,11 +1,16 @@
 # SIM7600E-H stable symlinks by USB interface number
-# Interface 0: Diag
+# Supports both standard mode (PID 9001) and ECM mode (PID 9011)
+
+# --- Standard mode (PID 9001): interfaces 00-04 ---
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="sim7600-diag"
-# Interface 1: NMEA
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="sim7600-nmea"
-# Interface 2: AT commands (modem)
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{ID_USB_INTERFACE_NUM}=="02", SYMLINK+="sim7600-at"
-# Interface 3: AT commands (secondary)
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{ID_USB_INTERFACE_NUM}=="03", SYMLINK+="sim7600-at2"
-# Interface 4: Audio
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{ID_USB_INTERFACE_NUM}=="04", SYMLINK+="sim7600-audio"
+
+# --- ECM mode (PID 9011): interfaces 02-06 (00-01 used by ECM) ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9011", ENV{ID_USB_INTERFACE_NUM}=="02", SYMLINK+="sim7600-diag"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9011", ENV{ID_USB_INTERFACE_NUM}=="03", SYMLINK+="sim7600-nmea"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9011", ENV{ID_USB_INTERFACE_NUM}=="04", SYMLINK+="sim7600-at"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9011", ENV{ID_USB_INTERFACE_NUM}=="05", SYMLINK+="sim7600-at2"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9011", ENV{ID_USB_INTERFACE_NUM}=="06", SYMLINK+="sim7600-audio"
