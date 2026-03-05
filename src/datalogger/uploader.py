@@ -18,11 +18,13 @@ class Uploader(threading.Thread):
     Uses exponential backoff when uploads fail to avoid tight loops.
     """
 
-    def __init__(self, config, can_queue: queue.Queue, gps_queue: queue.Queue, buffer):
+    def __init__(self, config, can_queue: queue.Queue, gps_queue: queue.Queue,
+                 buffer, log_queue: queue.Queue | None = None):
         super().__init__(name="Uploader", daemon=True)
         self.config = config
         self.can_queue = can_queue
         self.gps_queue = gps_queue
+        self.log_queue = log_queue
         self.buffer = buffer
         self._stop_event = threading.Event()
         self.supabase: Client | None = None
@@ -71,6 +73,7 @@ class Uploader(threading.Thread):
                 self._flush_buffer()
                 self._drain_queue(self.can_queue, "can_frames", self._can_to_row)
                 self._drain_queue(self.gps_queue, "gps_readings", self._gps_to_row)
+                self._drain_logs()
                 self._stop_event.wait(0.05)
             except Exception:
                 logger.exception("Uploader loop error")
@@ -93,7 +96,11 @@ class Uploader(threading.Thread):
             return False
 
     def _buffer_queues(self):
-        """Drain both queues into local buffer while offline."""
+        """Drain data queues into local buffer while offline.
+
+        Log records are discarded when offline — they are ephemeral
+        and not worth buffering to disk.
+        """
         for q, table, transform in [
             (self.can_queue, "can_frames", self._can_to_row),
             (self.gps_queue, "gps_readings", self._gps_to_row),
@@ -104,6 +111,13 @@ class Uploader(threading.Thread):
                 except queue.Empty:
                     break
                 self.buffer.push(table, transform(record))
+        # Discard log records while offline
+        if self.log_queue is not None:
+            while not self.log_queue.empty():
+                try:
+                    self.log_queue.get_nowait()
+                except queue.Empty:
+                    break
 
     def _drain_queue(self, q: queue.Queue, table: str, transform):
         """Drain all items from a queue and upload them."""
@@ -153,6 +167,38 @@ class Uploader(threading.Thread):
                 self._go_offline()
                 break
         self.buffer.delete(uploaded_ids)
+
+    def _drain_logs(self):
+        """Drain log queue and upload to device_logs table.
+
+        Unlike data queues, log upload failures are silently ignored
+        to prevent infinite loops (a failed log upload would generate
+        a new warning log record, which would be re-enqueued).
+        """
+        if self.log_queue is None or self.supabase is None:
+            return
+        while not self.log_queue.empty():
+            try:
+                record = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            row = self._log_to_row(record)
+            try:
+                self.supabase.table("device_logs").insert(row).execute()
+            except Exception:
+                # Silently discard — never go offline or buffer for logs
+                break
+
+    @staticmethod
+    def _log_to_row(record: dict) -> dict:
+        return {
+            "timestamp": record["timestamp"],
+            "device_id": record["device_id"],
+            "level": record["level"],
+            "component": record["component"],
+            "message": record["message"],
+            "detail": record.get("detail"),
+        }
 
     @staticmethod
     def _can_to_row(record: dict) -> dict:

@@ -17,9 +17,10 @@ def _make_uploader(**kwargs):
     can_q = kwargs.get("can_queue", queue.Queue())
     gps_q = kwargs.get("gps_queue", queue.Queue())
     buf = kwargs.get("buffer", MagicMock())
+    log_q = kwargs.get("log_queue", queue.Queue())
     if "buffer" not in kwargs:
         buf.count.return_value = 0
-    return Uploader(config, can_q, gps_q, buf)
+    return Uploader(config, can_q, gps_q, buf, log_q)
 
 
 class TestUploaderTransforms:
@@ -218,6 +219,64 @@ class TestUploaderOfflineMode:
         u._go_offline()
         u._backoff = min(u._backoff * 2, 120.0)
         assert u._backoff == initial_backoff * 2
+
+
+class TestUploaderDrainLogs:
+    @patch("datalogger.uploader.create_client")
+    def test_drain_logs_uploads(self, mock_create):
+        log_q = queue.Queue()
+        log_q.put({
+            "type": "log", "timestamp": "t", "device_id": "d",
+            "level": "ERROR", "component": "can_reader",
+            "message": "bus crashed", "detail": "traceback...",
+        })
+        u = _make_uploader(log_queue=log_q)
+        u._connect()
+        u.supabase.table.return_value.insert.return_value.execute.return_value = True
+        u._drain_logs()
+        assert log_q.empty()
+        u.supabase.table.assert_called_with("device_logs")
+
+    @patch("datalogger.uploader.create_client")
+    def test_drain_logs_failure_no_offline(self, mock_create):
+        """Log upload failure should NOT trigger offline mode."""
+        log_q = queue.Queue()
+        log_q.put({
+            "type": "log", "timestamp": "t", "device_id": "d",
+            "level": "WARNING", "component": "gps_reader",
+            "message": "parse error",
+        })
+        u = _make_uploader(log_queue=log_q)
+        u._connect()
+        u.supabase.table.return_value.insert.return_value.execute.side_effect = (
+            Exception("network error")
+        )
+        u._drain_logs()
+        assert u._offline is False, "Log failures should not trigger offline mode"
+
+    @patch("datalogger.uploader.create_client")
+    def test_logs_discarded_when_offline(self, mock_create):
+        """Log records should be discarded (not buffered) when offline."""
+        log_q = queue.Queue()
+        log_q.put({
+            "type": "log", "timestamp": "t", "device_id": "d",
+            "level": "ERROR", "component": "system",
+            "message": "something",
+        })
+        buf = MagicMock()
+        buf.count.return_value = 0
+        u = _make_uploader(log_queue=log_q, buffer=buf)
+        u._buffer_queues()
+        assert log_q.empty(), "Log records should be drained when offline"
+        # Logs should NOT be pushed to buffer
+        for call in buf.push.call_args_list:
+            assert call[0][0] != "device_logs"
+
+    def test_drain_logs_skipped_without_queue(self):
+        """_drain_logs should be a no-op if log_queue is None."""
+        u = _make_uploader()
+        u.log_queue = None
+        u._drain_logs()  # should not raise
 
 
 class TestUploaderThread:

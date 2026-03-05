@@ -81,6 +81,7 @@ Run the SQL migration files in order via the [Supabase SQL Editor](https://supab
 
 1. `migrations/001_create_can_frames.sql` — CAN frames table with indexes and RLS
 2. `migrations/002_create_gps_readings.sql` — GPS readings table with indexes and RLS
+3. `migrations/003_create_device_logs.sql` — Device error/warning logs for remote monitoring
 
 ### 3. Configure environment
 
@@ -187,6 +188,20 @@ vcgencmd get_throttled
 | `speed` | `DOUBLE PRECISION` | Speed in km/h |
 | `course` | `DOUBLE PRECISION` | Heading in degrees |
 | `raw_response` | `TEXT` | Raw NMEA sentence for debugging |
+
+### `device_logs`
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `BIGINT` | Auto-incrementing primary key |
+| `timestamp` | `TIMESTAMPTZ` | When the event occurred (UTC) |
+| `device_id` | `TEXT` | Device identifier |
+| `level` | `TEXT` | Log level (`ERROR`, `WARNING`) |
+| `component` | `TEXT` | Source module (`can_reader`, `gps_reader`, `uploader`, etc.) |
+| `message` | `TEXT` | Human-readable error message |
+| `detail` | `TEXT` | Exception traceback (if applicable) |
+
+WARNING and ERROR log messages are automatically forwarded to this table for remote monitoring. Duplicate messages are rate-limited (1 per component+message per 60 seconds). Log upload failures are silently discarded to prevent infinite loops.
 
 ## Fault Tolerance
 

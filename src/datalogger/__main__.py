@@ -12,6 +12,7 @@ from datalogger.buffer import LocalBuffer
 from datalogger.can_reader import CANReader
 from datalogger.config import Config
 from datalogger.gps_reader import GPSReader
+from datalogger.log_handler import SupabaseLogHandler
 from datalogger.logger import setup_logging
 from datalogger.uploader import Uploader
 
@@ -32,6 +33,11 @@ def main():
     # Create shared queues
     can_queue = queue.Queue(maxsize=config.upload_queue_maxsize)
     gps_queue = queue.Queue(maxsize=100)
+    log_queue = queue.Queue(maxsize=100)
+
+    # Attach log handler that forwards WARNING+ to Supabase
+    log_handler = SupabaseLogHandler(config.device_id, log_queue)
+    logging.getLogger("datalogger").addHandler(log_handler)
 
     # Create local buffer for offline resilience
     buffer = LocalBuffer(config.buffer_db_path)
@@ -42,7 +48,7 @@ def main():
     # Create worker threads
     can_reader = CANReader(config, can_queue)
     gps_reader = GPSReader(config, gps_queue)
-    uploader = Uploader(config, can_queue, gps_queue, buffer)
+    uploader = Uploader(config, can_queue, gps_queue, buffer, log_queue)
 
     # Start all threads
     can_reader.start()
