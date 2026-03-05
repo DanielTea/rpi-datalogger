@@ -27,6 +27,16 @@ class Config:
     can_bitrate: int = field(
         default_factory=lambda: int(os.environ.get("CAN_BITRATE", "500000"))
     )
+    can_enabled: bool = field(
+        default_factory=lambda: os.environ.get("CAN_ENABLED", "true").lower() in ("true", "1", "yes")
+    )
+    can_filter_ids: list = field(
+        default_factory=lambda: [
+            int(x.strip(), 16)
+            for x in os.environ.get("CAN_FILTER_IDS", "").split(",")
+            if x.strip()
+        ]
+    )
 
     # GPS
     gps_serial_port: str = field(
