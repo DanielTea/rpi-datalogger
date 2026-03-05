@@ -1,0 +1,17 @@
+[Unit]
+Description=SIM7600 LTE Data Connection (ECM/USB Ethernet)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Wait for usb0 to appear (modem boots slowly)
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do [ -e /sys/class/net/usb0 ] && exit 0; sleep 2; done; exit 1'
+ExecStart=/sbin/ip link set usb0 up
+# Add default route via usb0 with lower metric than WiFi
+ExecStartPost=/bin/bash -c 'sleep 5; /sbin/ip route add default dev usb0 metric 100 2>/dev/null || true'
+ExecStop=/sbin/ip link set usb0 down
+
+[Install]
+WantedBy=multi-user.target

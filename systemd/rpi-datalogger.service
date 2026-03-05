@@ -8,7 +8,8 @@ Type=simple
 User=root
 WorkingDirectory=/home/daniel/rpi-datalogger
 EnvironmentFile=/home/daniel/rpi-datalogger/.env
-ExecStart=/usr/bin/python3 -m datalogger
+Environment=PYTHONPATH=/home/daniel/rpi-datalogger/src
+ExecStart=/home/daniel/rpi-datalogger/.venv/bin/python3 -m datalogger
 Restart=always
 RestartSec=5
 

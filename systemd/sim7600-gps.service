@@ -1,0 +1,13 @@
+[Unit]
+Description=Enable SIM7600 GPS
+After=multi-user.target
+ConditionPathExists=/dev/sim7600-at
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 3
+ExecStart=/bin/bash -c 'test -c /dev/sim7600-at && echo -e "AT+CGPS=1\r" > /dev/sim7600-at || echo "GPS port not available"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
