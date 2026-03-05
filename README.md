@@ -48,7 +48,7 @@ rpi-datalogger/
 │   ├── uploader.py       # Supabase uploader with offline fallback
 │   ├── buffer.py         # SQLite FIFO buffer for offline resilience
 │   └── logger.py         # Logging config (stdout → journald)
-├── tests/                # 83 unit tests (pytest)
+├── tests/                # 114 unit tests (pytest)
 ├── migrations/           # Supabase SQL table definitions
 ├── systemd/              # Service files, udev rules, helper scripts
 │   ├── rpi-datalogger.service
@@ -196,12 +196,16 @@ vcgencmd get_throttled
 | `id` | `BIGINT` | Auto-incrementing primary key |
 | `timestamp` | `TIMESTAMPTZ` | When the event occurred (UTC) |
 | `device_id` | `TEXT` | Device identifier |
-| `level` | `TEXT` | Log level (`ERROR`, `WARNING`) |
+| `level` | `TEXT` | Log level (`ERROR`, `WARNING`, `INFO` for startup) |
 | `component` | `TEXT` | Source module (`can_reader`, `gps_reader`, `uploader`, etc.) |
 | `message` | `TEXT` | Human-readable error message |
 | `detail` | `TEXT` | Exception traceback (if applicable) |
 
 WARNING and ERROR log messages are automatically forwarded to this table for remote monitoring. Duplicate messages are rate-limited (1 per component+message per 60 seconds). Log upload failures are silently discarded to prevent infinite loops.
+
+On every startup, two INFO-level records are pushed directly to this table:
+- **Startup config** — device ID, CAN interface, GPS port, Supabase connectivity
+- **System status** — CPU temperature, throttle state, memory, disk, uptime, kernel version
 
 ## Fault Tolerance
 
@@ -221,7 +225,7 @@ source .venv/bin/activate
 PYTHONPATH=src python -m pytest tests/ -v
 ```
 
-83 tests covering CAN reader (noise filtering, ID filtering, backoff), GPS reader (NMEA parsing, throttling), uploader (online/offline transitions, buffering), and the SQLite buffer (FIFO ordering, pruning).
+114 tests covering CAN reader (noise filtering, ID filtering, backoff), GPS reader (NMEA parsing, throttling), uploader (online/offline transitions, buffering, log draining), SQLite buffer (FIFO ordering, pruning), log handler (rate limiting, component extraction), and startup logging (system status collection).
 
 ## Power Optimization
 
@@ -246,36 +250,33 @@ dtparam=act_led_trigger=none
 dtparam=act_led_activelow=off
 EOF
 
-# Comment out conflicting defaults (if present)
+# 2. Disable GPU/KMS driver (not needed headless, also enables vcgencmd display_power)
+sudo sed -i 's/^dtoverlay=vc4-kms-v3d/# dtoverlay=vc4-kms-v3d/' /boot/firmware/config.txt
+sudo sed -i 's/^max_framebuffers=2/# max_framebuffers=2/' /boot/firmware/config.txt
+sudo sed -i 's/^disable_fw_kms_setup=1/# disable_fw_kms_setup=1/' /boot/firmware/config.txt
+
+# 3. Comment out conflicting defaults (if present)
 sudo sed -i 's/^dtparam=audio=on/# dtparam=audio=on/' /boot/firmware/config.txt
 sudo sed -i 's/^camera_auto_detect=1/# camera_auto_detect=1/' /boot/firmware/config.txt
 sudo sed -i 's/^display_auto_detect=1/# display_auto_detect=1/' /boot/firmware/config.txt
 sudo sed -i 's/^arm_boost=1/# arm_boost=1/' /boot/firmware/config.txt
 
-# 2. Set CPU governor to powersave (persistent)
-sudo tee /etc/systemd/system/cpu-powersave.service << 'EOF'
-[Unit]
-Description=Set CPU governor to powersave
-After=multi-user.target
+# 4. Limit to 2 CPU cores (saves ~20-40mA, sufficient for 1 Hz data collection)
+CMDLINE=$(cat /boot/firmware/cmdline.txt)
+echo "${CMDLINE} maxcpus=2" | sudo tee /boot/firmware/cmdline.txt
 
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# 5. Set CPU governor to powersave (persistent via systemd)
+sudo cp systemd/cpu-powersave.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable cpu-powersave
 
-# 3. Disable Bluetooth services
+# 6. Disable Bluetooth services
 sudo systemctl disable --now hciuart bluetooth 2>/dev/null
 
-# 4. Blacklist unused USB WiFi drivers (if using onboard WiFi)
+# 7. Blacklist unused USB WiFi drivers (if using onboard WiFi)
 echo 'blacklist rtl8192cu' | sudo tee /etc/modprobe.d/blacklist-edimax.conf
 
-# 5. Reboot to apply
+# 8. Reboot to apply
 sudo reboot
 ```
 
@@ -283,10 +284,11 @@ sudo reboot
 
 | Change | Savings | Notes |
 |---|---|---|
-| Disable HDMI | ~30mA | `hdmi_blanking=2` in config.txt |
+| Disable HDMI + KMS driver | ~30mA | Removes GPU driver entirely, HDMI PHY powers down |
 | Disable Bluetooth | ~20mA | `dtoverlay=disable-bt` + disable services |
 | Remove USB WiFi dongle | ~50-80mA | Use onboard WiFi instead |
 | CPU powersave (600MHz) | ~20-50mA | Sufficient for 1 Hz data collection |
+| Disable CPU cores 2-3 | ~20-40mA | `maxcpus=2` in cmdline.txt, 2 cores is plenty |
 | Disable audio subsystem | ~5mA | `dtparam=audio=off` |
 | GPU memory 16MB | ~5-10mA | Headless operation, no GPU needed |
 | Disable arm_boost | reduces spikes | Prevents transient current draw |
