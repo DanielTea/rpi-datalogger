@@ -208,6 +208,105 @@ PYTHONPATH=src python -m pytest tests/ -v
 
 83 tests covering CAN reader (noise filtering, ID filtering, backoff), GPS reader (NMEA parsing, throttling), uploader (online/offline transitions, buffering), and the SQLite buffer (FIFO ordering, pruning).
 
+## Power Optimization
+
+The SIM7600 modem draws significant current (~200-400mA) and can cause undervoltage on the Pi's 5V rail, leading to USB bus resets and modem disconnects. A **3A power supply** is recommended, but the following optimizations reduce draw by ~130-200mA and make the system stable even on weaker supplies.
+
+### Quick Setup
+
+Apply all power optimizations at once:
+
+```bash
+# 1. Add power saving options to /boot/firmware/config.txt
+sudo tee -a /boot/firmware/config.txt << 'EOF'
+
+# --- Power saving ---
+hdmi_blanking=2
+dtoverlay=disable-bt
+dtparam=audio=off
+camera_auto_detect=0
+display_auto_detect=0
+gpu_mem=16
+dtparam=act_led_trigger=none
+dtparam=act_led_activelow=off
+EOF
+
+# Comment out conflicting defaults (if present)
+sudo sed -i 's/^dtparam=audio=on/# dtparam=audio=on/' /boot/firmware/config.txt
+sudo sed -i 's/^camera_auto_detect=1/# camera_auto_detect=1/' /boot/firmware/config.txt
+sudo sed -i 's/^display_auto_detect=1/# display_auto_detect=1/' /boot/firmware/config.txt
+sudo sed -i 's/^arm_boost=1/# arm_boost=1/' /boot/firmware/config.txt
+
+# 2. Set CPU governor to powersave (persistent)
+sudo tee /etc/systemd/system/cpu-powersave.service << 'EOF'
+[Unit]
+Description=Set CPU governor to powersave
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo powersave > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable cpu-powersave
+
+# 3. Disable Bluetooth services
+sudo systemctl disable --now hciuart bluetooth 2>/dev/null
+
+# 4. Blacklist unused USB WiFi drivers (if using onboard WiFi)
+echo 'blacklist rtl8192cu' | sudo tee /etc/modprobe.d/blacklist-edimax.conf
+
+# 5. Reboot to apply
+sudo reboot
+```
+
+### What Each Change Saves
+
+| Change | Savings | Notes |
+|---|---|---|
+| Disable HDMI | ~30mA | `hdmi_blanking=2` in config.txt |
+| Disable Bluetooth | ~20mA | `dtoverlay=disable-bt` + disable services |
+| Remove USB WiFi dongle | ~50-80mA | Use onboard WiFi instead |
+| CPU powersave (600MHz) | ~20-50mA | Sufficient for 1 Hz data collection |
+| Disable audio subsystem | ~5mA | `dtparam=audio=off` |
+| GPU memory 16MB | ~5-10mA | Headless operation, no GPU needed |
+| Disable arm_boost | reduces spikes | Prevents transient current draw |
+
+### Checking Power Status
+
+```bash
+# Check current throttle state
+vcgencmd get_throttled
+
+# Decode the result:
+# 0x0     = clean, no issues
+# 0x1     = undervoltage RIGHT NOW
+# 0x50000 = undervoltage occurred since boot (historical)
+# 0x50005 = undervoltage active + throttled
+```
+
+### USB Recovery
+
+If the modem drops off USB due to undervoltage (no `/dev/ttyUSB*` or `/dev/sim7600-*`), you can try a USB rebind before rebooting:
+
+```bash
+# Find the modem's USB path
+MODEM_PORT=$(ls /sys/bus/usb/devices/ | grep '1-1\.' | head -1)
+
+# Rebind
+sudo sh -c "echo $MODEM_PORT > /sys/bus/usb/drivers/usb/unbind"
+sleep 2
+sudo sh -c "echo $MODEM_PORT > /sys/bus/usb/drivers/usb/bind"
+sleep 5
+
+# Restart services
+sudo systemctl restart sim7600-gps sim7600-lte rpi-datalogger
+```
+
 ## LTE Connectivity
 
 The SIM7600 runs in **ECM mode** (USB Ethernet), appearing as a `usb0` network interface. This is more reliable than PPP on this hardware. The `lte-monitor.py` watchdog keeps the interface up and restores the default route if it disappears.

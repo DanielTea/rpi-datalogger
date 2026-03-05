@@ -1,20 +1,56 @@
 # SIM7600E-H Setup
 
-## USB Ports
+## USB Modes
 
-When connected via USB, the SIM7600E-H exposes 6 interfaces:
+The SIM7600 supports two USB modes. **ECM mode is recommended** — it provides a simple USB Ethernet interface (`usb0`) that is far more reliable than PPP or QMI on this hardware.
 
-| Port | Purpose | Notes |
+### ECM Mode (PID 9011) — Recommended
+
+Switch to ECM mode (one-time, persists across reboots):
+
+```bash
+# Connect to AT port and send:
+echo -e "AT+CUSBPIDSWITCH=9011,1,1\r" > /dev/ttyUSB2
+```
+
+> **Warning**: This reboots the modem. Use a stable 2.5A+ power supply to avoid USB bus crashes.
+
+In ECM mode, USB interfaces 00-01 are used by the ECM Ethernet adapter (`usb0`), and serial ports shift to interfaces 02-06:
+
+| Symlink | Interface (ECM) | Purpose |
 |---|---|---|
-| `/dev/ttyUSB0` | Diagnostic | May disconnect intermittently |
-| `/dev/ttyUSB1` | NMEA GPS output | Raw NMEA stream |
-| `/dev/ttyUSB2` | AT commands | Shared with GPS CGPSINFO output |
-| `/dev/ttyUSB3` | AT commands (modem) | **Clean AT port** — use for modem control |
-| `/dev/ttyUSB4` | Audio | Not used |
-| `wwan0` | QMI WWAN | Data interface |
+| `/dev/sim7600-diag` | 02 | Diagnostic port |
+| `/dev/sim7600-nmea` | 03 | NMEA GPS output (raw stream) |
+| `/dev/sim7600-at` | 04 | AT commands (GPS enable, modem control) |
+| `/dev/sim7600-at2` | 05 | AT commands (secondary) |
+| `/dev/sim7600-audio` | 06 | Audio (not used) |
+| `usb0` | 00-01 | **LTE data** (USB Ethernet / CDC ECM) |
 
-> **Important**: When GPS is active, `/dev/ttyUSB2` will have CGPSINFO output mixed in.
-> Use `/dev/ttyUSB3` for clean AT command interaction.
+### Standard Mode (PID 9001)
+
+In standard mode, serial ports are on interfaces 00-04:
+
+| Symlink | Interface (Std) | Purpose |
+|---|---|---|
+| `/dev/sim7600-diag` | 00 | Diagnostic port |
+| `/dev/sim7600-nmea` | 01 | NMEA GPS output |
+| `/dev/sim7600-at` | 02 | AT commands |
+| `/dev/sim7600-at2` | 03 | AT commands (secondary) |
+| `/dev/sim7600-audio` | 04 | Audio (not used) |
+
+To switch back to standard mode: `AT+CUSBPIDSWITCH=9001,1,1`
+
+## Udev Rules (Stable Symlinks)
+
+The `/dev/ttyUSB*` numbers can change across reboots. Udev rules in `systemd/99-sim7600.rules` create stable symlinks that work in both USB modes:
+
+```bash
+sudo cp systemd/99-sim7600.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+After this, always use `/dev/sim7600-at`, `/dev/sim7600-nmea`, etc. instead of `/dev/ttyUSB*`.
 
 ## SIM Card Setup
 
@@ -72,25 +108,23 @@ Expected output:
 
 ## GPS Setup
 
+### How GPS Works
+
+The SIM7600's GPS outputs NMEA sentences on a dedicated serial port (`/dev/sim7600-nmea`). The datalogger reads two sentence types:
+
+- **$GPRMC / $GNRMC** — latitude, longitude, speed (km/h), course (heading)
+- **$GPGGA / $GNGGA** — altitude (meters above sea level)
+
+This dedicated NMEA port avoids conflicts with the AT command port used for modem control.
+
 ### Enable GPS on Boot (systemd service)
 
+The GPS enable script (`systemd/enable-gps.py`) waits for the AT port, checks if GPS is already running, and enables it with retries:
+
 ```bash
-sudo tee /etc/systemd/system/sim7600-gps.service << EOF
-[Unit]
-Description=Enable SIM7600 GPS
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStartPre=/bin/sleep 5
-ExecStart=/bin/bash -c 'echo -e "AT+CGPS=1\r" > /dev/ttyUSB2'
-RemainAfterExit=yes
-ExecStop=/bin/bash -c 'echo -e "AT+CGPS=0\r" > /dev/ttyUSB2'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+sudo mkdir -p /opt/sim7600
+sudo cp systemd/enable-gps.py /opt/sim7600/
+sudo cp systemd/sim7600-gps.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now sim7600-gps.service
 ```
@@ -98,17 +132,16 @@ sudo systemctl enable --now sim7600-gps.service
 ### Test GPS
 
 ```bash
-echo -e "AT+CGPSINFO\r" > /dev/ttyUSB2; sleep 1; cat /dev/ttyUSB2
+# Check GPS is enabled
+echo -e "AT+CGPS?\r" > /dev/sim7600-at; sleep 1; cat /dev/sim7600-at
+# Expected: +CGPS: 1,1
+
+# Read raw NMEA stream
+cat /dev/sim7600-nmea
+# Expected: $GPRMC,123725.00,A,5232.352790,N,01324.503530,E,...
 ```
 
-Expected (with fix):
-```
-+CGPSINFO: 5232.352790,N,01324.503530,E,040326,123725.0,83.4,0.0,
-```
-
-Format: `lat,N/S,lon,E/W,date(ddmmyy),time(hhmmss),alt(m),speed(km/h),course`
-
-> **Note**: GPS cold start can take 1-3 minutes. Works best near a window or outdoors.
+> **Note**: GPS cold start can take 1-3 minutes. Works best near a window or outdoors. The datalogger will automatically start uploading GPS data as soon as a fix is acquired.
 
 ## Troubleshooting
 
