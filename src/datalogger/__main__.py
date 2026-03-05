@@ -26,6 +26,8 @@ def main():
     logger.info("CAN interface: %s", config.can_interface)
     logger.info("GPS port: %s", config.gps_serial_port)
     logger.info("Supabase URL: %s", config.supabase_url[:30] + "..." if config.supabase_url else "NOT SET")
+    if config.can_filter_ids:
+        logger.info("CAN filter IDs: %s", ", ".join("0x" + format(x, "X") for x in config.can_filter_ids))
 
     # Create shared queues
     can_queue = queue.Queue(maxsize=config.upload_queue_maxsize)
