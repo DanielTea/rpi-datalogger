@@ -335,3 +335,31 @@ AT+CUSBPIDSWITCH=9011,1,1
 ```
 
 **Warning**: This command reboots the modem. Ensure a stable power supply (2.5A+) to avoid USB bus crashes during the switch.
+
+## Remote Access (Tailscale)
+
+The Pi's LTE connection is behind carrier-grade NAT (CGNAT), so it can't be reached directly. [Tailscale](https://tailscale.com/) creates a mesh VPN that works through NAT, giving the Pi a stable IP reachable from anywhere.
+
+### Setup
+
+```bash
+# Install on the Pi
+curl -fsSL https://tailscale.com/install.sh | sudo sh
+
+# Start with built-in SSH server
+sudo tailscale up --ssh
+
+# Follow the auth URL printed to the terminal
+```
+
+Install Tailscale on your laptop too ([download](https://tailscale.com/download)), then connect:
+
+```bash
+# SSH via Tailscale IP
+ssh daniel@100.113.231.61
+
+# Or via MagicDNS hostname
+ssh daniel@raspberrypi.tail9ba309.ts.net
+```
+
+Tailscale survives reboots (`tailscaled.service` is enabled by default). Works over LTE, WiFi, or any network — no port forwarding needed.
