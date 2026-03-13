@@ -31,7 +31,7 @@ Raspberry Pi vehicle datalogger that captures OBD-II vehicle data and GPS coordi
 
 Three daemon threads run independently:
 
-- **OBD Reader** actively polls OBD-II PIDs over CAN bus at ~2 Hz via python-can (socketcan). On startup, sends a wake-up sequence to activate the vehicle's diagnostic gateway (required on VW vehicles where the OBD CAN lines are behind a gateway that only responds after receiving a diagnostic request). Polls RPM, vehicle speed, coolant temperature, throttle position, intake air temperature, and engine load.
+- **OBD Reader** actively polls 24 OBD-II PIDs over CAN bus via python-can (socketcan). On startup, sends a wake-up sequence to activate the vehicle's diagnostic gateway (required on VW vehicles where the OBD CAN lines are behind a gateway that only responds after receiving a diagnostic request). Polls engine data (RPM, load, coolant/intake/ambient/catalyst temps), fuel trims, throttle/pedal positions, timing, pressures, voltages, and counters.
 - **GPS Reader** parses NMEA sentences (`$GPRMC`, `$GPGGA`) streamed from the SIM7600's dedicated NMEA serial port (`/dev/sim7600-nmea`). Extracts latitude, longitude, altitude, speed, and course at a configurable interval (default 1 Hz).
 - **Uploader** drains both queues and inserts each record into Supabase via REST API. On failure, records are buffered to a local SQLite database (WAL mode, FIFO, max 100k records) and flushed automatically when connectivity returns.
 
@@ -143,12 +143,16 @@ CREATE TABLE obd_readings (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   timestamp timestamptz NOT NULL DEFAULT now(),
   device_id text NOT NULL,
-  rpm real,
-  speed_kmh real,
-  coolant_temp real,
-  throttle_pct real,
-  intake_temp real,
-  engine_load real
+  rpm real, speed_kmh real, engine_load real,
+  coolant_temp real, throttle_pos real, intake_temp real,
+  intake_pressure real, timing_advance real,
+  fuel_trim_short real, fuel_trim_long real,
+  air_fuel_ratio real, evap_purge real,
+  rel_throttle_pos real, abs_throttle_b real,
+  accel_pedal_d real, accel_pedal_e real, cmd_throttle real,
+  ambient_temp real, catalyst_temp real,
+  ctrl_module_volt real, baro_pressure real, abs_load real,
+  runtime integer, dist_since_clear integer
 );
 
 ALTER TABLE obd_readings ENABLE ROW LEVEL SECURITY;
@@ -270,19 +274,37 @@ sudo systemctl start sim7600-gps
 
 ### `obd_readings`
 
-| Column | Type | Description |
-|---|---|---|
-| `id` | `BIGINT` | Auto-incrementing primary key |
-| `timestamp` | `TIMESTAMPTZ` | Capture time (UTC) |
-| `device_id` | `TEXT` | Device identifier |
-| `rpm` | `REAL` | Engine RPM |
-| `speed_kmh` | `REAL` | Vehicle speed in km/h |
-| `coolant_temp` | `REAL` | Coolant temperature in °C |
-| `throttle_pct` | `REAL` | Throttle position in % |
-| `intake_temp` | `REAL` | Intake air temperature in °C |
-| `engine_load` | `REAL` | Calculated engine load in % |
+| Column | Type | PID | Description |
+|---|---|---|---|
+| `id` | `BIGINT` | — | Auto-incrementing primary key |
+| `timestamp` | `TIMESTAMPTZ` | — | Capture time (UTC) |
+| `device_id` | `TEXT` | — | Device identifier |
+| `rpm` | `REAL` | 0C | Engine RPM |
+| `speed_kmh` | `REAL` | 0D | Vehicle speed in km/h |
+| `engine_load` | `REAL` | 04 | Calculated engine load (%) |
+| `coolant_temp` | `REAL` | 05 | Coolant temperature (°C) |
+| `throttle_pos` | `REAL` | 11 | Throttle position (%) |
+| `intake_temp` | `REAL` | 0F | Intake air temperature (°C) |
+| `intake_pressure` | `REAL` | 0B | Intake manifold pressure (kPa) |
+| `timing_advance` | `REAL` | 0E | Timing advance (° before TDC) |
+| `fuel_trim_short` | `REAL` | 06 | Short term fuel trim bank 1 (%) |
+| `fuel_trim_long` | `REAL` | 07 | Long term fuel trim bank 1 (%) |
+| `air_fuel_ratio` | `REAL` | 44 | Commanded air-fuel equivalence ratio |
+| `evap_purge` | `REAL` | 2E | Commanded evaporative purge (%) |
+| `rel_throttle_pos` | `REAL` | 45 | Relative throttle position (%) |
+| `abs_throttle_b` | `REAL` | 47 | Absolute throttle position B (%) |
+| `accel_pedal_d` | `REAL` | 49 | Accelerator pedal position D (%) |
+| `accel_pedal_e` | `REAL` | 4A | Accelerator pedal position E (%) |
+| `cmd_throttle` | `REAL` | 4C | Commanded throttle actuator (%) |
+| `ambient_temp` | `REAL` | 46 | Ambient air temperature (°C) |
+| `catalyst_temp` | `REAL` | 3C | Catalyst temperature bank 1 (°C) |
+| `ctrl_module_volt` | `REAL` | 42 | Control module voltage (V) |
+| `baro_pressure` | `REAL` | 33 | Barometric pressure (kPa) |
+| `abs_load` | `REAL` | 43 | Absolute load value (%) |
+| `runtime` | `INTEGER` | 1F | Run time since engine start (seconds) |
+| `dist_since_clear` | `INTEGER` | 31 | Distance since codes cleared (km) |
 
-Polled at ~2 Hz via standard OBD-II Service 01 PIDs over CAN bus (500 kbps). The reader sends a gateway wake-up sequence on startup and re-wakes automatically if responses stop.
+24 PIDs polled via standard OBD-II Service 01 over CAN bus (500 kbps). The reader sends a gateway wake-up sequence on startup and re-wakes automatically if responses stop.
 
 ### `gps_readings`
 

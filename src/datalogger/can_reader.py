@@ -1,6 +1,5 @@
 import logging
 import queue
-import struct
 import threading
 import time
 from datetime import datetime, timezone
@@ -15,12 +14,36 @@ _MAX_BACKOFF = 60.0
 # OBD-II PIDs to poll: (pid, name, decode_func)
 # Service 01 PIDs — sent as 7DF#0201XX00000000
 _OBD_PIDS = [
-    (0x0C, "rpm",          lambda a, b: ((a << 8) | b) / 4.0),
-    (0x0D, "speed_kmh",    lambda a, b: a),
-    (0x05, "coolant_temp", lambda a, b: a - 40),
-    (0x11, "throttle_pct", lambda a, b: round(a * 100.0 / 255.0, 1)),
-    (0x0F, "intake_temp",  lambda a, b: a - 40),
-    (0x04, "engine_load",  lambda a, b: round(a * 100.0 / 255.0, 1)),
+    # Engine basics
+    (0x0C, "rpm",               lambda a, b: ((a << 8) | b) / 4.0),
+    (0x0D, "speed_kmh",         lambda a, b: a),
+    (0x04, "engine_load",       lambda a, b: round(a * 100.0 / 255.0, 1)),
+    (0x05, "coolant_temp",      lambda a, b: a - 40),
+    (0x11, "throttle_pos",      lambda a, b: round(a * 100.0 / 255.0, 1)),
+    (0x0F, "intake_temp",       lambda a, b: a - 40),
+    (0x0B, "intake_pressure",   lambda a, b: a),
+    (0x0E, "timing_advance",    lambda a, b: a / 2.0 - 64),
+    # Fuel
+    (0x06, "fuel_trim_short",   lambda a, b: round(a * 100.0 / 128.0 - 100.0, 1)),
+    (0x07, "fuel_trim_long",    lambda a, b: round(a * 100.0 / 128.0 - 100.0, 1)),
+    (0x44, "air_fuel_ratio",    lambda a, b: round(((a << 8) | b) * 2.0 / 65536.0, 3)),
+    (0x2E, "evap_purge",        lambda a, b: round(a * 100.0 / 255.0, 1)),
+    # Throttle / pedal
+    (0x45, "rel_throttle_pos",  lambda a, b: round(a * 100.0 / 255.0, 1)),
+    (0x47, "abs_throttle_b",    lambda a, b: round(a * 100.0 / 255.0, 1)),
+    (0x49, "accel_pedal_d",     lambda a, b: round(a * 100.0 / 255.0, 1)),
+    (0x4A, "accel_pedal_e",     lambda a, b: round(a * 100.0 / 255.0, 1)),
+    (0x4C, "cmd_throttle",      lambda a, b: round(a * 100.0 / 255.0, 1)),
+    # Temperatures
+    (0x46, "ambient_temp",      lambda a, b: a - 40),
+    (0x3C, "catalyst_temp",     lambda a, b: round(((a << 8) | b) / 10.0 - 40.0, 1)),
+    # Electrical / pressure
+    (0x42, "ctrl_module_volt",  lambda a, b: round(((a << 8) | b) / 1000.0, 2)),
+    (0x33, "baro_pressure",     lambda a, b: a),
+    (0x43, "abs_load",          lambda a, b: round(((a << 8) | b) * 100.0 / 255.0, 1)),
+    # Counters
+    (0x1F, "runtime",           lambda a, b: (a << 8) | b),
+    (0x31, "dist_since_clear",  lambda a, b: (a << 8) | b),
 ]
 
 # OBD broadcast request/response IDs
@@ -33,7 +56,7 @@ _WAKE_INTERVAL = 0.5
 
 
 class CANReader(threading.Thread):
-    """Polls OBD-II PIDs over CAN bus at 1 Hz.
+    """Polls OBD-II PIDs over CAN bus at ~2 Hz.
 
     On VW vehicles the OBD CAN lines are behind a gateway that only
     activates after receiving a diagnostic request. This reader sends
@@ -154,6 +177,3 @@ class CANReader(threading.Thread):
                     self.out_queue.put_nowait(record)
                 except queue.Full:
                     logger.warning("CAN queue full, dropping OBD record")
-
-                # ~1 Hz polling: sleep for remainder of the second
-                self._stop_event.wait(0.5)

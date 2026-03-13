@@ -215,16 +215,15 @@ class Uploader(threading.Thread):
 
     @staticmethod
     def _obd_to_row(record: dict) -> dict:
-        return {
+        row = {
             "timestamp": record["timestamp"],
             "device_id": record["device_id"],
-            "rpm": record.get("rpm"),
-            "speed_kmh": record.get("speed_kmh"),
-            "coolant_temp": record.get("coolant_temp"),
-            "throttle_pct": record.get("throttle_pct"),
-            "intake_temp": record.get("intake_temp"),
-            "engine_load": record.get("engine_load"),
         }
+        # Copy all OBD fields (everything except type, timestamp, device_id)
+        for k, v in record.items():
+            if k not in ("type", "timestamp", "device_id"):
+                row[k] = v
+        return row
 
     @staticmethod
     def _gps_to_row(record: dict) -> dict:
