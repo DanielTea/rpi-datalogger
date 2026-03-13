@@ -71,7 +71,7 @@ class Uploader(threading.Thread):
                     continue
 
                 self._flush_buffer()
-                self._drain_queue(self.can_queue, "can_frames", self._can_to_row)
+                self._drain_queue(self.can_queue, "obd_readings", self._obd_to_row)
                 self._drain_queue(self.gps_queue, "gps_readings", self._gps_to_row)
                 self._drain_logs()
                 self._stop_event.wait(0.05)
@@ -89,7 +89,7 @@ class Uploader(threading.Thread):
         if self.supabase is None:
             return False
         try:
-            self.supabase.table("can_frames").select("id").limit(1).execute()
+            self.supabase.table("obd_readings").select("id").limit(1).execute()
             return True
         except Exception:
             self.supabase = None
@@ -102,7 +102,7 @@ class Uploader(threading.Thread):
         and not worth buffering to disk.
         """
         for q, table, transform in [
-            (self.can_queue, "can_frames", self._can_to_row),
+            (self.can_queue, "obd_readings", self._obd_to_row),
             (self.gps_queue, "gps_readings", self._gps_to_row),
         ]:
             while not q.empty():
@@ -211,6 +211,19 @@ class Uploader(threading.Thread):
             "dlc": record["dlc"],
             "data": "\\x" + record["data"].hex(),
             "bus_time": record["bus_time"],
+        }
+
+    @staticmethod
+    def _obd_to_row(record: dict) -> dict:
+        return {
+            "timestamp": record["timestamp"],
+            "device_id": record["device_id"],
+            "rpm": record.get("rpm"),
+            "speed_kmh": record.get("speed_kmh"),
+            "coolant_temp": record.get("coolant_temp"),
+            "throttle_pct": record.get("throttle_pct"),
+            "intake_temp": record.get("intake_temp"),
+            "engine_load": record.get("engine_load"),
         }
 
     @staticmethod

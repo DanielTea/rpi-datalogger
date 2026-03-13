@@ -1,5 +1,6 @@
 import logging
 import queue
+import struct
 import threading
 import time
 from datetime import datetime, timezone
@@ -10,19 +11,34 @@ logger = logging.getLogger(__name__)
 
 _MIN_BACKOFF = 2.0
 _MAX_BACKOFF = 60.0
-_NOISE_THRESHOLD = 5  # need at least this many frames/sec to consider bus active
+
+# OBD-II PIDs to poll: (pid, name, decode_func)
+# Service 01 PIDs — sent as 7DF#0201XX00000000
+_OBD_PIDS = [
+    (0x0C, "rpm",          lambda a, b: ((a << 8) | b) / 4.0),
+    (0x0D, "speed_kmh",    lambda a, b: a),
+    (0x05, "coolant_temp", lambda a, b: a - 40),
+    (0x11, "throttle_pct", lambda a, b: round(a * 100.0 / 255.0, 1)),
+    (0x0F, "intake_temp",  lambda a, b: a - 40),
+    (0x04, "engine_load",  lambda a, b: round(a * 100.0 / 255.0, 1)),
+]
+
+# OBD broadcast request/response IDs
+_OBD_REQUEST_ID = 0x7DF
+_OBD_RESPONSE_ID = 0x7E8
+
+# Wake-up: send supported-PIDs request until gateway responds
+_WAKE_TIMEOUT = 10.0
+_WAKE_INTERVAL = 0.5
 
 
 class CANReader(threading.Thread):
-    """Reads CAN frames from socketcan, sampling one frame per second.
+    """Polls OBD-II PIDs over CAN bus at 1 Hz.
 
-    Filters out floating-bus noise: when the CAN bus is disconnected,
-    the transceiver picks up sporadic random frames. Real CAN traffic
-    produces many frames per second consistently. We require at least
-    _NOISE_THRESHOLD frames in a 1-second window before forwarding.
-
-    Optional: set CAN_FILTER_IDS in .env to only accept specific
-    arbitration IDs (comma-separated hex, e.g. "7DF,7E8,100").
+    On VW vehicles the OBD CAN lines are behind a gateway that only
+    activates after receiving a diagnostic request. This reader sends
+    a wake-up sequence on startup, then continuously polls standard
+    OBD-II PIDs and pushes decoded values to the output queue.
     """
 
     def __init__(self, config, out_queue: queue.Queue):
@@ -30,9 +46,6 @@ class CANReader(threading.Thread):
         self.config = config
         self.out_queue = out_queue
         self._stop_event = threading.Event()
-        self._filter_ids = set(config.can_filter_ids) if config.can_filter_ids else None
-        if self._filter_ids:
-            logger.info("CAN ID filter: %s", ", ".join("0x" + format(x, "X") for x in self._filter_ids))
 
     def stop(self):
         self._stop_event.set()
@@ -50,48 +63,97 @@ class CANReader(threading.Thread):
                 self._stop_event.wait(backoff)
                 backoff = min(backoff * 2, _MAX_BACKOFF)
 
+    def _wake_gateway(self, bus: can.Bus) -> bool:
+        """Send OBD requests until the gateway responds or timeout."""
+        logger.info("Waking up OBD gateway...")
+        wake_msg = can.Message(
+            arbitration_id=_OBD_REQUEST_ID,
+            data=b'\x02\x01\x00\x00\x00\x00\x00\x00',
+            is_extended_id=False,
+        )
+        deadline = time.monotonic() + _WAKE_TIMEOUT
+        attempt = 0
+        while time.monotonic() < deadline and not self._stop_event.is_set():
+            attempt += 1
+            try:
+                bus.send(wake_msg)
+            except can.CanError:
+                time.sleep(_WAKE_INTERVAL)
+                continue
+
+            # Listen briefly for a response
+            listen_until = time.monotonic() + _WAKE_INTERVAL
+            while time.monotonic() < listen_until:
+                msg = bus.recv(timeout=listen_until - time.monotonic())
+                if msg and msg.arbitration_id == _OBD_RESPONSE_ID:
+                    logger.info(
+                        "Gateway responded after %d attempts", attempt
+                    )
+                    return True
+        logger.warning("Gateway did not respond after %.0fs", _WAKE_TIMEOUT)
+        return False
+
+    def _request_pid(self, bus: can.Bus, pid: int) -> can.Message | None:
+        """Send a single OBD PID request and wait for the response."""
+        msg = can.Message(
+            arbitration_id=_OBD_REQUEST_ID,
+            data=bytes([0x02, 0x01, pid, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            is_extended_id=False,
+        )
+        try:
+            bus.send(msg)
+        except can.CanError:
+            return None
+
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            resp = bus.recv(timeout=deadline - time.monotonic())
+            if resp is None:
+                break
+            if (resp.arbitration_id == _OBD_RESPONSE_ID
+                    and len(resp.data) >= 4
+                    and resp.data[1] == 0x41
+                    and resp.data[2] == pid):
+                return resp
+        return None
+
     def _read_loop(self):
-        logger.info("Opening CAN bus on %s (1 Hz sampling)", self.config.can_interface)
+        logger.info("Opening CAN bus on %s", self.config.can_interface)
         with can.Bus(
             channel=self.config.can_interface, interface="socketcan"
         ) as bus:
             logger.info("CAN bus opened successfully")
+
+            if not self._wake_gateway(bus):
+                logger.warning("Continuing anyway — will retry PIDs")
+
             while not self._stop_event.is_set():
-                frames = []
-                deadline = time.monotonic() + 1.0
-                while time.monotonic() < deadline and not self._stop_event.is_set():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                obd_data = {}
+                for pid, name, decode in _OBD_PIDS:
+                    if self._stop_event.is_set():
                         break
-                    msg = bus.recv(timeout=remaining)
-                    if msg is not None and not msg.is_error_frame:
-                        if self._filter_ids is None or msg.arbitration_id in self._filter_ids:
-                            frames.append(msg)
+                    resp = self._request_pid(bus, pid)
+                    if resp is not None:
+                        a = resp.data[3]
+                        b = resp.data[4] if len(resp.data) > 4 else 0
+                        obd_data[name] = decode(a, b)
 
-                if self._stop_event.is_set() or not frames:
+                if self._stop_event.is_set() or not obd_data:
+                    # No responses — try waking again
+                    if not obd_data:
+                        self._wake_gateway(bus)
                     continue
 
-                # Noise filter: floating bus produces sporadic frames,
-                # real traffic produces many. Skip if below threshold.
-                if len(frames) < _NOISE_THRESHOLD:
-                    continue
-
-                latest = frames[-1]
                 record = {
-                    "type": "can",
+                    "type": "obd",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "device_id": self.config.device_id,
-                    "arb_id": latest.arbitration_id,
-                    "is_extended": latest.is_extended_id,
-                    "is_remote": latest.is_remote_frame,
-                    "dlc": latest.dlc,
-                    "data": bytes(latest.data),
-                    "bus_time": latest.timestamp,
+                    **obd_data,
                 }
                 try:
                     self.out_queue.put_nowait(record)
                 except queue.Full:
-                    logger.warning(
-                        "CAN queue full, dropping frame arb_id=0x%X",
-                        latest.arbitration_id,
-                    )
+                    logger.warning("CAN queue full, dropping OBD record")
+
+                # ~1 Hz polling: sleep for remainder of the second
+                self._stop_event.wait(0.5)
