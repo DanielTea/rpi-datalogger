@@ -1,11 +1,12 @@
 # RPi Datalogger
 
-Raspberry Pi vehicle datalogger that captures CAN bus frames and GPS coordinates in realtime and uploads them to Supabase over 4G LTE. Designed for unattended, always-on operation with automatic recovery from network outages, power cycles, and hardware disconnects.
+Raspberry Pi vehicle datalogger that captures OBD-II vehicle data and GPS coordinates in realtime and uploads them to Supabase over 4G LTE. Designed for unattended, always-on operation with automatic recovery from network outages, power cycles, and hardware disconnects.
 
 ## Hardware
 
 - **Raspberry Pi 3B+** (or any model with 40-pin GPIO header)
 - **PiCAN 2** — MCP2515 CAN bus controller over SPI, directly on the GPIO header
+- **OBD-II breakout box** (e.g. DUOYI DY29) — breaks out the 16 OBD-II pins to banana sockets with activity LEDs
 - **SIM7600E-H** — 4G LTE modem with built-in GPS, connected via USB
 - **SIM card** with data plan (tested with Vodafone/LIDL Connect)
 - **2.5A+ power supply** — the SIM7600 draws significant current; underpowered supplies cause USB resets
@@ -14,8 +15,8 @@ Raspberry Pi vehicle datalogger that captures CAN bus frames and GPS coordinates
 
 ```
 ┌─────────────┐      ┌───────────┐      ┌───────────────┐
-│  CAN Reader │─────>│ can_queue │──┐   │               │
-│  (socketcan)│      └───────────┘  ├──>│   Uploader    │──> Supabase
+│  OBD Reader │─────>│ can_queue │──┐   │               │
+│  (CAN/OBD2) │      └───────────┘  ├──>│   Uploader    │──> Supabase
 └─────────────┘                     │   │               │    (4G LTE)
 ┌─────────────┐      ┌───────────┐  │   └───────┬───────┘
 │  GPS Reader │─────>│ gps_queue │──┘           │
@@ -30,7 +31,7 @@ Raspberry Pi vehicle datalogger that captures CAN bus frames and GPS coordinates
 
 Three daemon threads run independently:
 
-- **CAN Reader** reads frames from `can0` via python-can (socketcan), sampling at 1 Hz. Includes a noise threshold filter — requires at least 5 frames/second to distinguish real bus traffic from floating-pin artifacts on a disconnected bus. Optionally filters by arbitration ID whitelist.
+- **OBD Reader** actively polls OBD-II PIDs over CAN bus at ~2 Hz via python-can (socketcan). On startup, sends a wake-up sequence to activate the vehicle's diagnostic gateway (required on VW vehicles where the OBD CAN lines are behind a gateway that only responds after receiving a diagnostic request). Polls RPM, vehicle speed, coolant temperature, throttle position, intake air temperature, and engine load.
 - **GPS Reader** parses NMEA sentences (`$GPRMC`, `$GPGGA`) streamed from the SIM7600's dedicated NMEA serial port (`/dev/sim7600-nmea`). Extracts latitude, longitude, altitude, speed, and course at a configurable interval (default 1 Hz).
 - **Uploader** drains both queues and inserts each record into Supabase via REST API. On failure, records are buffered to a local SQLite database (WAL mode, FIFO, max 100k records) and flushed automatically when connectivity returns.
 
@@ -43,7 +44,7 @@ rpi-datalogger/
 ├── src/datalogger/
 │   ├── __main__.py       # Entry point, thread orchestration, signal handling
 │   ├── config.py         # Dataclass config loaded from .env
-│   ├── can_reader.py     # CAN bus reader thread with noise filtering
+│   ├── can_reader.py     # OBD-II PID poller with gateway wake-up
 │   ├── gps_reader.py     # GPS NMEA parser thread
 │   ├── uploader.py       # Supabase uploader with offline fallback
 │   ├── buffer.py         # SQLite FIFO buffer for offline resilience
@@ -97,14 +98,65 @@ nano .env
 | `DEVICE_ID` | `rpi-001` | Identifier for this Pi in the database |
 | `CAN_INTERFACE` | `can0` | SocketCAN interface name |
 | `CAN_BITRATE` | `500000` | CAN bus bitrate in bps |
-| `CAN_FILTER_IDS` | _(empty)_ | Optional comma-separated hex IDs to whitelist (e.g. `7DF,7E8,100`) |
+| `CAN_ENABLED` | `true` | Enable/disable OBD-II polling |
 | `GPS_SERIAL_PORT` | `/dev/sim7600-nmea` | NMEA serial port for GPS data |
 | `GPS_SERIAL_BAUD` | `115200` | Serial baud rate |
 | `GPS_POLL_INTERVAL` | `1.0` | GPS emit rate in seconds |
 | `BUFFER_DB_PATH` | `/var/lib/rpi-datalogger/buffer.db` | SQLite buffer location |
 | `UPLOAD_QUEUE_MAXSIZE` | `1000` | Max in-memory queue size before dropping |
 
-### 4. Install udev rules for SIM7600
+### 4. Wire OBD-II to PiCAN2
+
+Connect the PiCAN2's CAN_H and CAN_L to the vehicle's OBD-II port. The easiest method is an OBD-II breakout box (e.g. DUOYI DY29) which exposes all 16 pins as banana sockets with activity LEDs.
+
+| OBD-II Pin | Signal | PiCAN2 Terminal |
+|------------|--------|-----------------|
+| Pin 6      | CAN_H  | CAN_H           |
+| Pin 14     | CAN_L  | CAN_L           |
+
+**VW-specific note**: VW vehicles (Polo 6R, Golf, etc.) use a diagnostic gateway that only activates the OBD CAN lines after receiving a diagnostic request. The datalogger handles this automatically by sending a wake-up sequence on startup. The LEDs on the breakout box will only flicker once the datalogger is running — they won't show activity with just ignition on.
+
+**Verifying the connection**:
+
+```bash
+# With ignition on, measure with a multimeter:
+# Pin 6 to Pin 4 (CAN_H to GND): ~2.5V idle, fluctuating when active
+# Pin 14 to Pin 4 (CAN_L to GND): ~2.5V idle, fluctuating when active
+# Pin 16 to Pin 4 (BAT+ to GND): ~12V (confirms OBD port has power)
+
+# With PiCAN2 connected, test OBD communication:
+cansend can0 7DF#0201000000000000  # Request supported PIDs
+candump can0                        # Should see 7E8 response
+```
+
+### 5. Create Supabase tables
+
+Run the SQL migration files in order via the [Supabase SQL Editor](https://supabase.com/dashboard/project/_/sql):
+
+1. `migrations/001_create_can_frames.sql` — CAN frames table (legacy)
+2. `migrations/002_create_gps_readings.sql` — GPS readings table
+3. `migrations/003_create_device_logs.sql` — Device logs
+4. Create the OBD readings table:
+
+```sql
+CREATE TABLE obd_readings (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  timestamp timestamptz NOT NULL DEFAULT now(),
+  device_id text NOT NULL,
+  rpm real,
+  speed_kmh real,
+  coolant_temp real,
+  throttle_pct real,
+  intake_temp real,
+  engine_load real
+);
+
+ALTER TABLE obd_readings ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow inserts" ON obd_readings FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow reads" ON obd_readings FOR SELECT USING (true);
+```
+
+### 6. Install udev rules for SIM7600
 
 The SIM7600 exposes multiple USB serial ports. Udev rules create stable symlinks (`/dev/sim7600-at`, `/dev/sim7600-nmea`, etc.) regardless of enumeration order. Rules support both standard mode (PID `9001`) and ECM mode (PID `9011`).
 
@@ -114,7 +166,7 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-### 5. Install systemd services
+### 7. Install systemd services
 
 ```bash
 # GPS enable service (runs AT+CGPS=1 on boot)
@@ -131,16 +183,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable sim7600-gps sim7600-lte rpi-datalogger
 ```
 
-### 6. Test manually
+### 8. Test manually
 
 ```bash
 source .venv/bin/activate
 PYTHONPATH=src python3 -m datalogger
 ```
 
-Check the Supabase dashboard for incoming rows in `can_frames` and `gps_readings`.
+Check the Supabase dashboard for incoming rows in `obd_readings` and `gps_readings`.
 
-### 7. Start services
+### 9. Start services
 
 ```bash
 sudo systemctl start sim7600-gps sim7600-lte rpi-datalogger
@@ -216,19 +268,21 @@ sudo systemctl start sim7600-gps
 
 ## Supabase Tables
 
-### `can_frames`
+### `obd_readings`
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | `BIGINT` | Auto-incrementing primary key |
 | `timestamp` | `TIMESTAMPTZ` | Capture time (UTC) |
 | `device_id` | `TEXT` | Device identifier |
-| `arb_id` | `INTEGER` | CAN arbitration ID |
-| `is_extended` | `BOOLEAN` | Extended frame flag |
-| `is_remote` | `BOOLEAN` | Remote frame flag |
-| `dlc` | `SMALLINT` | Data length code (0-8) |
-| `data` | `BYTEA` | Raw CAN payload |
-| `bus_time` | `DOUBLE PRECISION` | python-can hardware timestamp |
+| `rpm` | `REAL` | Engine RPM |
+| `speed_kmh` | `REAL` | Vehicle speed in km/h |
+| `coolant_temp` | `REAL` | Coolant temperature in °C |
+| `throttle_pct` | `REAL` | Throttle position in % |
+| `intake_temp` | `REAL` | Intake air temperature in °C |
+| `engine_load` | `REAL` | Calculated engine load in % |
+
+Polled at ~2 Hz via standard OBD-II Service 01 PIDs over CAN bus (500 kbps). The reader sends a gateway wake-up sequence on startup and re-wakes automatically if responses stop.
 
 ### `gps_readings`
 
@@ -266,15 +320,15 @@ On every startup, two INFO-level records are pushed directly to this table:
 
 ```bash
 # Check row counts for each table
-for TABLE in can_frames gps_readings device_logs; do
+for TABLE in obd_readings gps_readings device_logs; do
   echo -n "$TABLE: "
   curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/$TABLE?select=count" \
     -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" \
     -H "Prefer: count=exact" -o /dev/null -w "%{http_code}" && echo " OK"
 done
 
-# Verify CAN frames are arriving (requires active CAN bus)
-curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/can_frames?order=id.desc&limit=1" \
+# Verify OBD readings are arriving (requires ignition on + CAN connected)
+curl -s "https://YOUR_PROJECT.supabase.co/rest/v1/obd_readings?order=id.desc&limit=1" \
   -H "apikey: YOUR_KEY" -H "Authorization: Bearer YOUR_KEY" | python3 -m json.tool
 
 # Verify GPS readings are arriving
@@ -293,7 +347,7 @@ The system is designed to survive unattended operation:
 
 - **Network outages**: Records buffer to SQLite (up to 100k entries). When connectivity returns, the buffer flushes in FIFO order before processing new data.
 - **Power cycles**: All three systemd services are enabled at boot. GPS enable script retries up to 5 times. LTE monitor restores the default route if lost.
-- **CAN bus disconnect**: Floating-pin noise is filtered out (threshold: 5+ frames/sec required). When the bus is reconnected, data flows immediately.
+- **CAN bus disconnect**: When the OBD gateway stops responding, the reader automatically re-sends the wake-up sequence. When the bus is reconnected, polling resumes immediately.
 - **GPS cold start**: GPS data uploads begin as soon as a satellite fix is acquired. CAN data uploads independently without waiting for GPS.
 - **USB resets**: Udev rules ensure stable device symlinks across USB re-enumeration. Services restart automatically via systemd.
 - **Crash recovery**: All threads use exponential backoff (CAN: 2-60s, GPS: 2-60s, Uploader: 5-120s) to avoid tight crash loops.
